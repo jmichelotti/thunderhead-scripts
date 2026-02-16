@@ -170,16 +170,21 @@ def process_file(path: Path, dry_run: bool):
 
         success = remux_to_mp4(path, tmp_out, dry_run)
 
-    # --- MKV handling ---
+    # --- MKV handling (convert to MP4) ---
     elif ext == ".mkv":
         if not needs_fix(ffinfo):
             if VERBOSE:
                 print(f"[SKIP] {path} (already OK)")
             return
 
-        # If MKV needs fix, remux back to MKV (not MP4)
-        tmp_out = path.with_suffix(".tmp.mkv")
-        success = remux_to_mkv(path, tmp_out, dry_run)
+        can_remux = vcodec in SAFE_VIDEO_CODECS and acodec in SAFE_AUDIO_CODECS
+
+        if can_remux:
+            print(f"[MKV -> REMUX] {path} (v={vcodec}, a={acodec})")
+            success = remux_to_mp4(path, tmp_out, dry_run)
+        else:
+            print(f"[MKV -> REENCODE] {path} (v={vcodec}, a={acodec})")
+            success = reencode_to_mp4(path, tmp_out, dry_run)
 
     if success and not dry_run:
         print(f"[DELETE] {path}")
