@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body {
+      width: 420px;
+      max-height: 550px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      margin: 0;
+      padding: 12px;
+      background: #1a1a2e;
+      color: #e0e0e0;
+    }
+    h2 {
+      margin: 0 0 8px 0;
+      font-size: 15px;
+      color: #7c3aed;
+    }
+    .status-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #333;
+    }
+    .server-status {
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .server-up { background: #064e3b; color: #6ee7b7; }
+    .server-down { background: #7f1d1d; color: #fca5a5; }
+    button {
+      background: #374151;
+      color: #e0e0e0;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button:hover { background: #4b5563; }
+    .section-label {
+      font-size: 11px;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin: 10px 0 6px 0;
+    }
+    .downloads {
+      overflow-y: auto;
+      max-height: 420px;
+    }
+    .dl-card {
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      background: #16213e;
+      border-radius: 6px;
+      border-left: 3px solid #555;
+    }
+    .dl-card.downloading { border-left-color: #f59e0b; }
+    .dl-card.done { border-left-color: #22c55e; }
+    .dl-card.error { border-left-color: #ef4444; }
+    .dl-card.queued { border-left-color: #6366f1; }
+    .dl-card.moving { border-left-color: #8b5cf6; }
+    .dl-card.dry_run { border-left-color: #6b7280; }
+    .dl-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    .dl-filename {
+      font-weight: 600;
+      font-size: 13px;
+      color: #f3f4f6;
+    }
+    .dl-status {
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 8px;
+      font-weight: 600;
+    }
+    .dl-status.downloading { background: #78350f; color: #fbbf24; }
+    .dl-status.done { background: #064e3b; color: #6ee7b7; }
+    .dl-status.error { background: #7f1d1d; color: #fca5a5; }
+    .dl-status.queued { background: #312e81; color: #a5b4fc; }
+    .dl-status.moving { background: #4c1d95; color: #c4b5fd; }
+    .dl-status.dry_run { background: #374151; color: #9ca3af; }
+    .dl-meta {
+      display: flex;
+      gap: 12px;
+      font-size: 11px;
+      color: #9ca3af;
+      margin-bottom: 6px;
+    }
+    .dl-meta span { white-space: nowrap; }
+    .dl-meta .quality { color: #818cf8; font-weight: 600; }
+    .progress-bar-bg {
+      width: 100%;
+      height: 6px;
+      background: #1e293b;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #7c3aed, #a78bfa);
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+    .progress-bar-fill.done {
+      background: #22c55e;
+    }
+    .progress-text {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: #6b7280;
+      margin-top: 3px;
+    }
+    .empty {
+      color: #6b7280;
+      text-align: center;
+      padding: 30px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="status-bar">
+    <h2>HLS Capture</h2>
+    <span id="serverStatus" class="server-status server-down">checking...</span>
+    <button id="clearBtn">Clear</button>
+  </div>
+  <div id="downloads" class="downloads">
+    <div class="empty">No downloads yet. Browse to a video page and press play.</div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

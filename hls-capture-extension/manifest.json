@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "HLS Capture for Jellyfin",
+  "version": "1.0",
+  "description": "Captures m3u8 URLs and sends them to local download server for Jellyfin",
+  "permissions": [
+    "webRequest",
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "HLS Capture"
+  }
+}
