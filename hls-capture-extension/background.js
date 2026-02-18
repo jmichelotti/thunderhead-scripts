@@ -14,6 +14,19 @@ const subtitlesSent = new Set();
 // Track m3u8 URLs already pending or confirmed to avoid duplicates
 const seenM3u8 = new Set();
 
+// Auto-capture state
+let autoCapture = {
+  active: false,
+  finished: false,
+  tabId: null,
+  season: null,
+  startEp: null,
+  endEp: null,
+  currentEp: null,
+  doneCount: 0,
+  totalCount: 0,
+};
+
 // Listen for m3u8 and subtitle requests
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -45,9 +58,17 @@ chrome.webRequest.onBeforeRequest.addListener(
     chrome.tabs.get(tabId, (tab) => {
       if (chrome.runtime.lastError) return;
 
+      const pageUrl = tab?.url || "";
+
+      // Auto-capture mode: skip pending queue, auto-confirm immediately
+      if (autoCapture.active && tabId === autoCapture.tabId) {
+        autoConfirmCapture(url, pageUrl, tabId);
+        return;
+      }
+
       const pending = {
         m3u8_url: url,
-        page_url: tab?.url || "",
+        page_url: pageUrl,
         tabId: tabId,
         timestamp: Date.now(),
         preview: null,
@@ -195,6 +216,13 @@ async function sendSubtitle(subtitleUrl, pageUrl) {
 }
 
 function updateBadge() {
+  // Auto-capture mode: show progress like "3/15"
+  if (autoCapture.active) {
+    chrome.action.setBadgeText({ text: `${autoCapture.doneCount}/${autoCapture.totalCount}` });
+    chrome.action.setBadgeBackgroundColor({ color: "#4338ca" });
+    return;
+  }
+
   const pendingCount = pendingCaptures.length;
   const activeCount = captures.filter(
     (c) => c.status === "sending" || c.status === "downloading"
@@ -214,6 +242,78 @@ function updateBadge() {
   }
 }
 
+// --- Auto-capture functions ---
+
+async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
+  const capture = {
+    m3u8_url: m3u8Url,
+    page_url: pageUrl,
+    timestamp: Date.now(),
+    status: "sending",
+  };
+  captures.push(capture);
+
+  if (captures.length > 50) {
+    captures = captures.slice(-50);
+  }
+
+  updateBadge();
+  await sendToServer(capture);
+
+  // Wait a moment for any remaining subtitle requests to arrive at the server
+  // (subtitles load on page init but some may still be in-flight)
+  await new Promise((r) => setTimeout(r, 2000));
+
+  // Notify the content script that this episode is done
+  autoCapture.doneCount++;
+  updateBadge();
+
+  notifyTab(tabId, {
+    type: "autoCaptureEpisodeDone",
+    season: autoCapture.season,
+    episode: autoCapture.currentEp,
+  });
+}
+
+function startAutoCapture(season, startEp, endEp, tabId) {
+  autoCapture = {
+    active: true,
+    finished: false,
+    tabId,
+    season,
+    startEp,
+    endEp,
+    currentEp: startEp,
+    doneCount: 0,
+    totalCount: endEp - startEp + 1,
+  };
+
+  // Clear seen state so first episode's m3u8 and subtitles are detected fresh
+  seenM3u8.clear();
+  subtitlesSent.clear();
+  pendingCaptures = [];
+  updateBadge();
+
+  // Forward to content script — it will set the hash and reload the page
+  notifyTab(tabId, {
+    type: "beginAutoCapture",
+    season,
+    startEp,
+    endEp,
+  });
+}
+
+function stopAutoCapture() {
+  const tabId = autoCapture.tabId;
+  autoCapture.active = false;
+  autoCapture.finished = false;
+  updateBadge();
+
+  if (tabId) {
+    notifyTab(tabId, { type: "stopAutoCapture" });
+  }
+}
+
 // Handle messages from popup and content script
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "getCaptures") {
@@ -229,7 +329,80 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     pendingCaptures = [];
     subtitlesSent.clear();
     seenM3u8.clear();
+    autoCapture = { active: false, finished: false, tabId: null, season: null, startEp: null, endEp: null, currentEp: null, doneCount: 0, totalCount: 0 };
     updateBadge();
+    sendResponse({ ok: true });
+  } else if (msg.type === "startAutoCapture") {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0];
+      if (!tab) {
+        sendResponse({ ok: false, error: "No active tab" });
+        return;
+      }
+      startAutoCapture(msg.season, msg.startEp, msg.endEp, tab.id);
+      sendResponse({ ok: true });
+    });
+    return true; // async response
+  } else if (msg.type === "stopAutoCapture") {
+    stopAutoCapture();
+    sendResponse({ ok: true });
+  } else if (msg.type === "getAutoCaptureState") {
+    sendResponse({
+      active: autoCapture.active,
+      finished: autoCapture.finished,
+      season: autoCapture.season,
+      startEp: autoCapture.startEp,
+      endEp: autoCapture.endEp,
+      currentEp: autoCapture.currentEp,
+      doneCount: autoCapture.doneCount,
+      totalCount: autoCapture.totalCount,
+    });
+  } else if (msg.type === "checkAutoCapture") {
+    // Content script checks on page load if auto-capture is active for this tab
+    if (autoCapture.active && sender.tab && sender.tab.id === autoCapture.tabId) {
+      sendResponse({
+        active: true,
+        season: autoCapture.season,
+        currentEp: autoCapture.currentEp,
+        startEp: autoCapture.startEp,
+        endEp: autoCapture.endEp,
+      });
+    } else {
+      sendResponse({ active: false });
+    }
+  } else if (msg.type === "autoCaptureAdvance") {
+    // Content script finished an episode, advance to next or complete
+    if (autoCapture.active && autoCapture.currentEp < autoCapture.endEp) {
+      autoCapture.currentEp++;
+      // Clear seen state so next episode's m3u8 and subtitles are detected fresh
+      seenM3u8.clear();
+      subtitlesSent.clear();
+      updateBadge();
+      sendResponse({
+        hasNext: true,
+        season: autoCapture.season,
+        nextEp: autoCapture.currentEp,
+      });
+    } else {
+      autoCapture.active = false;
+      autoCapture.finished = true;
+      updateBadge();
+      sendResponse({ hasNext: false });
+    }
+  } else if (msg.type === "autoCaptureClickedPlay") {
+    // Content script tells us it clicked play for an episode — update current ep
+    autoCapture.currentEp = msg.episode;
+    updateBadge();
+    sendResponse({ ok: true });
+  } else if (msg.type === "autoCaptureComplete") {
+    autoCapture.active = false;
+    autoCapture.finished = true;
+    updateBadge();
+    sendResponse({ ok: true });
+  } else if (msg.type === "clearEpisodeState") {
+    // Clear seen m3u8s between episodes so the next capture is detected fresh
+    seenM3u8.clear();
+    subtitlesSent.clear();
     sendResponse({ ok: true });
   }
   return true;

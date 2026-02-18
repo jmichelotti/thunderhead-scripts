@@ -254,6 +254,11 @@ _pending_subs_lock = threading.Lock()
 _resolved_episodes: Dict[str, tuple] = {}
 _resolved_lock = threading.Lock()
 
+# Episodes that already have a saved subtitle — prevents race where multiple
+# threads pass the file-exists check before any have written the file
+_saved_subs: set = set()
+_saved_subs_lock = threading.Lock()
+
 
 def vtt_to_srt(vtt_text: str) -> str:
     """Convert WebVTT content to SRT format."""
@@ -353,6 +358,14 @@ def is_english_subtitle(text: str) -> bool:
     if mojibake_count > 2:
         return False
 
+    # Check for CP1250/Latin-1 encoding corruption: characters in U+0080–U+00BF
+    # (like ³ ¹ ¿ ¯ ± ¶) are Latin-1 supplement symbols that never appear in clean
+    # dialogue text. When Polish/Czech CP1250 is decoded as Latin-1, accented letters
+    # become these symbols (e.g. ł→³, ż→¿, ą→¹). More than 2 = encoding corruption.
+    latin1_symbols = sum(1 for c in sample if 0x80 <= ord(c) <= 0xBF)
+    if latin1_symbols > 2:
+        return False
+
     # Check for actual Unicode accented Latin characters (common in non-English European)
     # Only count real accented letters (À-ö, ø-ÿ, etc.), not stray bytes from
     # mis-decoded symbols like ♪ (U+266A) whose UTF-8 bytes E2/99/AA become â/\x99/ª
@@ -422,9 +435,11 @@ def download_subtitle(subtitle_url: str, ep_key: str):
     srt_name = f"{show_title} {ep_tag}.srt"
     srt_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / srt_name
 
-    if srt_path.exists():
-        print(f"  Subtitle skipped (already exists): {srt_path.name}", flush=True)
-        return
+    # Check if subtitle already saved (file on disk or claimed by another thread)
+    with _saved_subs_lock:
+        if ep_key in _saved_subs or srt_path.exists():
+            print(f"  Subtitle skipped (already exists): {srt_path.name}", flush=True)
+            return
 
     try:
         resp = requests.get(subtitle_url, timeout=15)
@@ -439,6 +454,13 @@ def download_subtitle(subtitle_url: str, ep_key: str):
         if not is_english_subtitle(content):
             print(f"  Subtitle rejected (not English): {subtitle_url[:80]}...", flush=True)
             return
+
+        # Claim this episode under lock so only the first English subtitle wins
+        with _saved_subs_lock:
+            if ep_key in _saved_subs:
+                print(f"  Subtitle skipped (already saved by another thread): {srt_path.name}", flush=True)
+                return
+            _saved_subs.add(ep_key)
 
         print(f"  Found English subtitle: {subtitle_url[:80]}...", flush=True)
 

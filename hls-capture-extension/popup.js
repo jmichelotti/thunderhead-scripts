@@ -172,7 +172,125 @@ document.getElementById("clearBtn").addEventListener("click", () => {
   });
 });
 
+// --- Auto-capture controls ---
+
+const acSection = document.getElementById("autoCapture");
+const acSeason = document.getElementById("acSeason");
+const acFromEp = document.getElementById("acFromEp");
+const acToEp = document.getElementById("acToEp");
+const acStartBtn = document.getElementById("acStartBtn");
+const acStopBtn = document.getElementById("acStopBtn");
+const acIdle = document.getElementById("acIdle");
+const acRunning = document.getElementById("acRunning");
+const acIdleStatus = document.getElementById("acIdleStatus");
+const acRunStatus = document.getElementById("acRunStatus");
+
+let currentTabSeason = null;
+
+// Parse season from the active tab's URL hash (#ep=season,episode)
+function parseSeasonFromUrl(url) {
+  if (!url) return null;
+  const match = url.match(/#ep=(\d+),(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+function updateAutoCaptureUI() {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs[0];
+    if (!tab) return;
+
+    const season = parseSeasonFromUrl(tab.url);
+    const serverUp = document.getElementById("serverStatus").classList.contains("server-up");
+
+    if (season !== null && serverUp) {
+      currentTabSeason = season;
+      acSection.classList.remove("hidden");
+      acSeason.textContent = `Season ${season}`;
+    } else {
+      acSection.classList.add("hidden");
+      currentTabSeason = null;
+    }
+  });
+
+  // Check auto-capture state from background
+  chrome.runtime.sendMessage({ type: "getAutoCaptureState" }, (state) => {
+    if (!state) return;
+
+    if (state.active) {
+      acSection.classList.remove("hidden");
+      acSection.classList.add("active");
+      acIdle.style.display = "none";
+      acRunning.style.display = "";
+      const current = state.currentEp || state.startEp;
+      const total = state.endEp - state.startEp + 1;
+      const done = current - state.startEp;
+      acRunStatus.textContent = `Capturing EP ${current} of ${state.startEp}–${state.endEp}...`;
+      if (state.doneCount !== undefined) {
+        acRunStatus.textContent = `EP ${current} of ${state.startEp}–${state.endEp} (${state.doneCount} captured)`;
+      }
+    } else if (state.finished) {
+      acSection.classList.add("active");
+      acIdle.style.display = "";
+      acRunning.style.display = "none";
+      acIdleStatus.textContent = `Done (${state.doneCount}/${state.totalCount} captured)`;
+      acIdleStatus.className = "ac-status done";
+    } else {
+      acSection.classList.remove("active");
+      acIdle.style.display = "";
+      acRunning.style.display = "none";
+    }
+  });
+}
+
+acStartBtn.addEventListener("click", () => {
+  if (currentTabSeason === null) return;
+
+  const startEp = parseInt(acFromEp.value, 10);
+  const endEp = parseInt(acToEp.value, 10);
+  if (!startEp || !endEp || startEp > endEp || startEp < 1) {
+    acIdleStatus.textContent = "Invalid episode range";
+    acIdleStatus.className = "ac-status error";
+    return;
+  }
+
+  acStartBtn.disabled = true;
+  acIdleStatus.textContent = "Starting...";
+
+  chrome.runtime.sendMessage({
+    type: "startAutoCapture",
+    season: currentTabSeason,
+    startEp,
+    endEp,
+  }, (resp) => {
+    acStartBtn.disabled = false;
+    if (resp && resp.ok) {
+      acIdle.style.display = "none";
+      acRunning.style.display = "";
+      acRunStatus.textContent = `Capturing EP ${startEp} of ${startEp}–${endEp}...`;
+    } else {
+      acIdleStatus.textContent = resp?.error || "Failed to start";
+      acIdleStatus.className = "ac-status error";
+    }
+  });
+});
+
+acStopBtn.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "stopAutoCapture" }, () => {
+    acIdle.style.display = "";
+    acRunning.style.display = "none";
+    acIdleStatus.textContent = "Stopped";
+    acIdleStatus.className = "ac-status error";
+    acSection.classList.remove("active");
+  });
+});
+
 refresh();
 
 // Refresh every 1 second while popup is open
-setInterval(refresh, 1000);
+setInterval(() => {
+  refresh();
+  updateAutoCaptureUI();
+}, 1000);
+
+// Initial auto-capture UI check
+updateAutoCaptureUI();
