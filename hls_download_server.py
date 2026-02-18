@@ -166,11 +166,7 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
               f"bv*[height<={MAX_HEIGHT}]+ba/best",
         "--merge-output-format", "mp4",
         "--postprocessor-args", "ffmpeg:-movflags +faststart",
-        "--write-sub",
-        "--write-auto-sub",
-        "--sub-lang", "en,eng",
-        "--convert-subs", "srt",
-        "--embed-subs",
+        "--no-write-subs",
         "--newline",  # Force one progress line per update (no \r overwrites)
         "-o", str(temp_file),
         m3u8_url,
@@ -232,8 +228,13 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
     shutil.move(str(temp_file), str(output_path))
     print(f"  Moved to: {output_path}", flush=True)
 
-    # Move any .srt files that match the video name
+    # Move any .srt files that match the video name (skip thumbnail sprites)
     for sub_file in TEMP_DIR.glob(f"{temp_file.stem}*.srt"):
+        content = sub_file.read_text(encoding="utf-8", errors="ignore")
+        if "xywh=" in content or "thumbnails" in content.lower():
+            sub_file.unlink()
+            print(f"  Deleted thumbnail sprite: {sub_file.name}", flush=True)
+            continue
         sub_dest = output_path.parent / sub_file.name
         shutil.move(str(sub_file), str(sub_dest))
         print(f"  Moved sub: {sub_file.name}", flush=True)
@@ -319,7 +320,7 @@ def vtt_to_srt(vtt_text: str) -> str:
 
 
 def is_english_subtitle(text: str) -> bool:
-    """Heuristic: check if subtitle text is predominantly English/ASCII."""
+    """Heuristic: check if subtitle text is predominantly English."""
     # Extract just the dialogue lines (skip timestamps, cue numbers, headers)
     dialogue = []
     for line in text.splitlines():
@@ -337,19 +338,71 @@ def is_english_subtitle(text: str) -> bool:
     if not dialogue:
         return False
 
-    # Sample first 30 dialogue lines
-    sample = " ".join(dialogue[:30])
+    # Sample first 50 dialogue lines for better accuracy
+    sample = " ".join(dialogue[:50])
     if not sample:
         return False
 
-    # Count ASCII letters vs non-ASCII
+    # Reject thumbnail sprite maps (VTT files with xywh= coordinates, not dialogue)
+    if "xywh=" in sample or "thumbnails" in sample.lower():
+        return False
+
+    # Check for UTF-8 mojibake (Latin text decoded as cp1252/latin1 then re-encoded)
+    # e.g. "Ã©" (é), "Ã¨" (è), "Ã´" (ô), "Ã§" (ç) — common in French/Spanish/etc.
+    mojibake_count = len(re.findall(r"Ã[\x80-\xbf]", sample))
+    if mojibake_count > 2:
+        return False
+
+    # Check for actual Unicode accented Latin characters (common in non-English European)
+    # Only count real accented letters (À-ö, ø-ÿ, etc.), not stray bytes from
+    # mis-decoded symbols like ♪ (U+266A) whose UTF-8 bytes E2/99/AA become â/\x99/ª
+    # when decoded as latin-1.
+    # Focus on the most common accented ranges used in European languages:
+    ACCENTED_RANGES = (
+        (0x00C0, 0x00D6),  # À-Ö
+        (0x00D8, 0x00F6),  # Ø-ö
+        (0x00F8, 0x00FF),  # ø-ÿ
+        (0x0100, 0x017F),  # Latin Extended-A
+        (0x0180, 0x024F),  # Latin Extended-B
+    )
+    accented = sum(
+        1 for c in sample
+        if any(lo <= ord(c) <= hi for lo, hi in ACCENTED_RANGES)
+    )
+    alpha = sum(1 for c in sample if c.isalpha())
+    if alpha > 0 and accented / alpha > 0.05:
+        return False
+
+    # Detect non-English by common foreign words/patterns
+    sample_lower = sample.lower()
+    foreign_markers = [
+        # French
+        r"\bje\b", r"\bqu['e]", r"\bc'est\b", r"\bune?\b", r"\bpour\b",
+        r"\bpas\b", r"\bvous\b", r"\bles\b", r"\bdes\b", r"\bdans\b",
+        # Spanish
+        r"\bel\b", r"\blos\b", r"\bpor\b", r"\bque\b", r"\buna\b",
+        r"\bestá\b", r"\bcomo\b",
+        # German
+        r"\bich\b", r"\bein\b", r"\bdas\b", r"\bist\b", r"\bnicht\b",
+        r"\baber\b",
+        # Portuguese
+        r"\bnão\b", r"\bcom\b", r"\buma\b", r"\bpara\b", r"\bvocê\b",
+    ]
+    foreign_hits = sum(
+        len(re.findall(pat, sample_lower)) for pat in foreign_markers
+    )
+    # English text might have occasional "the" matching "les" etc., but
+    # a high density of foreign words is a clear signal
+    if foreign_hits > 8:
+        return False
+
+    # Basic ASCII ratio check as final filter
     ascii_letters = sum(1 for c in sample if c.isascii() and c.isalpha())
     all_letters = sum(1 for c in sample if c.isalpha())
     if all_letters == 0:
         return False
 
-    ratio = ascii_letters / all_letters
-    return ratio > 0.9
+    return ascii_letters / all_letters > 0.9
 
 
 def download_subtitle(subtitle_url: str, ep_key: str):
@@ -370,15 +423,21 @@ def download_subtitle(subtitle_url: str, ep_key: str):
     srt_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / srt_name
 
     if srt_path.exists():
-        return  # Already have English subs for this episode
+        print(f"  Subtitle skipped (already exists): {srt_path.name}", flush=True)
+        return
 
     try:
         resp = requests.get(subtitle_url, timeout=15)
         resp.raise_for_status()
+        # Force UTF-8 decoding — VTT files are almost always UTF-8, but
+        # requests may guess latin-1 from headers, mangling multibyte chars
+        # like ♪ (U+266A) into separate bytes (â/\x99/ª)
+        resp.encoding = "utf-8"
         content = resp.text
 
         # Check if English before saving
         if not is_english_subtitle(content):
+            print(f"  Subtitle rejected (not English): {subtitle_url[:80]}...", flush=True)
             return
 
         print(f"  Found English subtitle: {subtitle_url[:80]}...", flush=True)
@@ -407,6 +466,60 @@ def process_pending_subs(ep_key: str):
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+
+
+def probe_formats(m3u8_url: str) -> list:
+    """Run yt-dlp -F to list available formats without downloading."""
+    cmd = ["yt-dlp", "-F", "--no-download", m3u8_url]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30
+        )
+        formats = []
+        for line in result.stdout.splitlines():
+            # Parse format lines like: "4500 mp4 1920x1080 ..."
+            m = re.match(
+                r"^(\S+)\s+(mp4|webm|mhtml|\w+)\s+(\d+x\d+|\w+)?\s*(.*)",
+                line.strip()
+            )
+            if m and "x" in (m.group(3) or ""):
+                fmt_id = m.group(1)
+                ext = m.group(2)
+                resolution = m.group(3) or ""
+                rest = m.group(4).strip()
+                formats.append({
+                    "format_id": fmt_id,
+                    "ext": ext,
+                    "resolution": resolution,
+                    "detail": rest,
+                })
+        return formats
+    except Exception as e:
+        print(f"  Format probe failed: {e}", flush=True)
+        return []
+
+
+def get_best_format_label(formats: list) -> str:
+    """Return a human-readable label for the best format that would be selected."""
+    if not formats:
+        return "unknown"
+    # Find highest resolution
+    best = None
+    best_pixels = 0
+    for f in formats:
+        res = f.get("resolution", "")
+        if "x" in res:
+            try:
+                w, h = res.split("x")
+                pixels = int(w) * int(h)
+                if pixels > best_pixels and int(h) <= MAX_HEIGHT:
+                    best_pixels = pixels
+                    best = f
+            except ValueError:
+                pass
+    if best:
+        return f"{best['resolution']} {best['ext']}"
+    return formats[-1].get("resolution", "unknown")
 
 
 class HLSHandler(BaseHTTPRequestHandler):
@@ -477,9 +590,66 @@ class HLSHandler(BaseHTTPRequestHandler):
             target=download_subtitle, args=(subtitle_url, ep_key), daemon=True
         ).start()
 
+    def _handle_preview(self):
+        """Return show info + quality without starting a download."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send_json({"status": "error", "message": str(e)}, 400)
+            return
+
+        m3u8_url = body.get("m3u8_url", "")
+        page_url = body.get("page_url", "")
+
+        if not m3u8_url:
+            self._send_json({"status": "error", "message": "missing m3u8_url"}, 400)
+            return
+
+        # Parse show info
+        info = parse_show_from_url(page_url)
+        if not info["show_name"] or info["season"] is None or info["episode"] is None:
+            self._send_json({
+                "status": "error",
+                "message": "Could not parse show/season/episode from page URL"
+            })
+            return
+
+        # OMDb lookup
+        meta = lookup_show(info["show_name"])
+        if meta:
+            show_title = sanitize_for_windows(f"{meta['title']} ({meta['year']})")
+        else:
+            show_title = sanitize_for_windows(info["show_name"])
+
+        season = info["season"]
+        episode = info["episode"]
+        ep_tag = f"S{season:02d}E{episode:02d}"
+        filename = f"{show_title} {ep_tag}.mp4"
+
+        # Probe available formats
+        formats = probe_formats(m3u8_url)
+        best_quality = get_best_format_label(formats)
+
+        print(f"  Preview: {filename} [{best_quality}]", flush=True)
+
+        self._send_json({
+            "status": "ok",
+            "show_title": show_title,
+            "season": season,
+            "episode": episode,
+            "ep_tag": ep_tag,
+            "filename": filename,
+            "quality": best_quality,
+            "formats": formats,
+        })
+
     def do_POST(self):
         if self.path == "/subtitle":
             self._handle_subtitle()
+            return
+        if self.path == "/preview":
+            self._handle_preview()
             return
         if self.path != "/capture":
             self._send_json({"error": "not found"}, 404)

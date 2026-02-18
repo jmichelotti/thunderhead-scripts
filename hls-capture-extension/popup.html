@@ -49,10 +49,74 @@
       letter-spacing: 0.5px;
       margin: 10px 0 6px 0;
     }
-    .downloads {
+    .scrollable {
       overflow-y: auto;
       max-height: 420px;
     }
+
+    /* Pending confirmation cards */
+    .pending-card {
+      padding: 10px;
+      margin-bottom: 6px;
+      background: #1e1e3a;
+      border-radius: 6px;
+      border-left: 3px solid #f59e0b;
+    }
+    .pending-card.loading { border-left-color: #6b7280; }
+    .pending-card.error { border-left-color: #ef4444; }
+    .pending-title {
+      font-weight: 600;
+      font-size: 14px;
+      color: #f3f4f6;
+      margin-bottom: 4px;
+    }
+    .pending-meta {
+      display: flex;
+      gap: 12px;
+      font-size: 12px;
+      color: #9ca3af;
+      margin-bottom: 8px;
+    }
+    .pending-meta .quality { color: #818cf8; font-weight: 600; }
+    .pending-meta .episode { color: #a78bfa; }
+    .pending-loading {
+      font-size: 12px;
+      color: #6b7280;
+      font-style: italic;
+    }
+    .pending-error {
+      font-size: 12px;
+      color: #fca5a5;
+    }
+    .pending-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    .btn-download {
+      background: #065f46;
+      color: #6ee7b7;
+      font-weight: 600;
+      padding: 5px 14px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .btn-download:hover { background: #047857; }
+    .btn-download:disabled { background: #374151; color: #6b7280; cursor: not-allowed; }
+    .btn-dismiss {
+      background: #374151;
+      color: #9ca3af;
+      padding: 5px 14px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .btn-dismiss:hover { background: #4b5563; }
+
+    /* Download progress cards */
     .dl-card {
       padding: 8px 10px;
       margin-bottom: 6px;
@@ -134,7 +198,8 @@
     <span id="serverStatus" class="server-status server-down">checking...</span>
     <button id="clearBtn">Clear</button>
   </div>
-  <div id="downloads" class="downloads">
+  <div id="pending"></div>
+  <div id="downloads" class="scrollable">
     <div class="empty">No downloads yet. Browse to a video page and press play.</div>
   </div>
   <script src="popup.js"></script>
