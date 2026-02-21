@@ -225,6 +225,7 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
 
     # Move from temp to final location (video + any subtitle files)
     update_download(ep_key, status="moving")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(temp_file), str(output_path))
     print(f"  Moved to: {output_path}", flush=True)
 
