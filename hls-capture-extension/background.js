@@ -2,10 +2,43 @@ const SERVER_URL = "http://localhost:9876/capture";
 const PREVIEW_URL = "http://localhost:9876/preview";
 const SUBTITLE_URL = "http://localhost:9876/subtitle";
 
+// ========= SITE CONFIGS =========
+
+const SITE_CONFIGS = {
+  "1movies.bz": {
+    navStrategy: "hash-reload",         // navigate via location.hash + reload
+    makeEpisodeHash: (s, e) => `#ep=${s},${e}`,
+    playButtonSelector: "#player button.player-btn",
+    subtitleWaitMs: 4000,
+  },
+  "brocoflix.xyz": {
+    navStrategy: "click-card",          // navigate by clicking .episode-card elements
+    playButtonSelector: ".episode-play-button", // inside each episode card
+    serverButtonSelector: ".server-button",     // Nth button = server N (1-indexed)
+    subtitleWaitMs: 5000,
+    showTitleSelector: "#details-container h1",
+    episodeCardSelector: ".episode-card",
+    seasonSelectSelector: "#season-select",
+  },
+};
+
+function getSiteConfig(url) {
+  if (!url) return null;
+  try {
+    const host = new URL(url).hostname;
+    for (const [site, cfg] of Object.entries(SITE_CONFIGS)) {
+      if (host.includes(site)) return { site, ...cfg };
+    }
+  } catch {}
+  return null;
+}
+
+// ========= STATE =========
+
 // Pending captures awaiting user confirmation: [{m3u8_url, page_url, tabId, timestamp, preview}]
 let pendingCaptures = [];
 
-// Confirmed/active captures: [{m3u8_url, page_url, timestamp, status, message}]
+// Confirmed/active captures: [{m3u8_url, page_url, tabId, timestamp, status, message}]
 let captures = [];
 
 // Track subtitle URLs per tab to avoid duplicates
@@ -13,6 +46,10 @@ const subtitlesSent = new Set();
 
 // Track m3u8 URLs already pending or confirmed to avoid duplicates
 const seenM3u8 = new Set();
+
+// Per-tab episode context set by content script for DOM-based sites (e.g. brocoflix)
+// Map<tabId, {show_name, season, episode}>
+const episodeContextByTab = new Map();
 
 // Auto-capture state
 let autoCapture = {
@@ -25,7 +62,11 @@ let autoCapture = {
   currentEp: null,
   doneCount: 0,
   totalCount: 0,
+  siteConfig: null,
+  serverNum: 1,
 };
+
+// ========= NETWORK INTERCEPTION =========
 
 // Listen for m3u8 and subtitle requests
 chrome.webRequest.onBeforeRequest.addListener(
@@ -42,7 +83,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 
       chrome.tabs.get(tabId, (tab) => {
         if (chrome.runtime.lastError) return;
-        sendSubtitle(url, tab?.url || "");
+        sendSubtitle(url, tab?.url || "", tabId);
       });
       return;
     }
@@ -94,7 +135,10 @@ chrome.webRequest.onBeforeRequest.addListener(
   []
 );
 
+// ========= PREVIEW / CONFIRM / SEND =========
+
 async function fetchPreview(pending, index) {
+  const ctx = episodeContextByTab.get(pending.tabId) || {};
   try {
     const resp = await fetch(PREVIEW_URL, {
       method: "POST",
@@ -102,6 +146,9 @@ async function fetchPreview(pending, index) {
       body: JSON.stringify({
         m3u8_url: pending.m3u8_url,
         page_url: pending.page_url,
+        show_name: ctx.show_name || "",
+        season: ctx.season ?? null,
+        episode: ctx.episode ?? null,
       }),
     });
 
@@ -157,6 +204,7 @@ async function confirmDownload(index) {
   const capture = {
     m3u8_url: pending.m3u8_url,
     page_url: pending.page_url,
+    tabId: pending.tabId,
     timestamp: Date.now(),
     status: "sending",
   };
@@ -179,6 +227,7 @@ function dismissCapture(index) {
 }
 
 async function sendToServer(capture) {
+  const ctx = episodeContextByTab.get(capture.tabId) || {};
   try {
     const resp = await fetch(SERVER_URL, {
       method: "POST",
@@ -186,6 +235,9 @@ async function sendToServer(capture) {
       body: JSON.stringify({
         m3u8_url: capture.m3u8_url,
         page_url: capture.page_url,
+        show_name: ctx.show_name || "",
+        season: ctx.season ?? null,
+        episode: ctx.episode ?? null,
       }),
     });
 
@@ -200,7 +252,8 @@ async function sendToServer(capture) {
   updateBadge();
 }
 
-async function sendSubtitle(subtitleUrl, pageUrl) {
+async function sendSubtitle(subtitleUrl, pageUrl, tabId) {
+  const ctx = tabId != null ? (episodeContextByTab.get(tabId) || {}) : {};
   try {
     await fetch(SUBTITLE_URL, {
       method: "POST",
@@ -208,12 +261,17 @@ async function sendSubtitle(subtitleUrl, pageUrl) {
       body: JSON.stringify({
         subtitle_url: subtitleUrl,
         page_url: pageUrl,
+        show_name: ctx.show_name || "",
+        season: ctx.season ?? null,
+        episode: ctx.episode ?? null,
       }),
     });
   } catch {
     // Server not running, ignore
   }
 }
+
+// ========= BADGE =========
 
 function updateBadge() {
   // Auto-capture mode: show progress like "3/15"
@@ -242,12 +300,13 @@ function updateBadge() {
   }
 }
 
-// --- Auto-capture functions ---
+// ========= AUTO-CAPTURE =========
 
 async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
   const capture = {
     m3u8_url: m3u8Url,
     page_url: pageUrl,
+    tabId: tabId,
     timestamp: Date.now(),
     status: "sending",
   };
@@ -275,7 +334,9 @@ async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
   });
 }
 
-function startAutoCapture(season, startEp, endEp, tabId) {
+function startAutoCapture(season, startEp, endEp, tabId, tabUrl, serverNum) {
+  const siteConfig = getSiteConfig(tabUrl);
+
   autoCapture = {
     active: true,
     finished: false,
@@ -286,6 +347,8 @@ function startAutoCapture(season, startEp, endEp, tabId) {
     currentEp: startEp,
     doneCount: 0,
     totalCount: endEp - startEp + 1,
+    siteConfig,
+    serverNum: serverNum || 1,
   };
 
   // Clear seen state so first episode's m3u8 and subtitles are detected fresh
@@ -294,12 +357,14 @@ function startAutoCapture(season, startEp, endEp, tabId) {
   pendingCaptures = [];
   updateBadge();
 
-  // Forward to content script — it will set the hash and reload the page
+  // Forward to content script — it will navigate to the first episode
   notifyTab(tabId, {
     type: "beginAutoCapture",
     season,
     startEp,
     endEp,
+    siteConfig,
+    serverNum: autoCapture.serverNum,
   });
 }
 
@@ -314,7 +379,8 @@ function stopAutoCapture() {
   }
 }
 
-// Handle messages from popup and content script
+// ========= MESSAGE HANDLER =========
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "getCaptures") {
     sendResponse({ captures, pendingCaptures });
@@ -329,7 +395,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     pendingCaptures = [];
     subtitlesSent.clear();
     seenM3u8.clear();
-    autoCapture = { active: false, finished: false, tabId: null, season: null, startEp: null, endEp: null, currentEp: null, doneCount: 0, totalCount: 0 };
+    episodeContextByTab.clear();
+    autoCapture = {
+      active: false, finished: false, tabId: null, season: null,
+      startEp: null, endEp: null, currentEp: null, doneCount: 0,
+      totalCount: 0, siteConfig: null,
+    };
     updateBadge();
     sendResponse({ ok: true });
   } else if (msg.type === "startAutoCapture") {
@@ -339,7 +410,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "No active tab" });
         return;
       }
-      startAutoCapture(msg.season, msg.startEp, msg.endEp, tab.id);
+      startAutoCapture(msg.season, msg.startEp, msg.endEp, tab.id, tab.url, msg.serverNum);
       sendResponse({ ok: true });
     });
     return true; // async response
@@ -366,6 +437,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         currentEp: autoCapture.currentEp,
         startEp: autoCapture.startEp,
         endEp: autoCapture.endEp,
+        siteConfig: autoCapture.siteConfig,
+        serverNum: autoCapture.serverNum,
       });
     } else {
       sendResponse({ active: false });
@@ -382,6 +455,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         hasNext: true,
         season: autoCapture.season,
         nextEp: autoCapture.currentEp,
+        startEp: autoCapture.startEp,
+        endEp: autoCapture.endEp,
+        siteConfig: autoCapture.siteConfig,
+        serverNum: autoCapture.serverNum,
       });
     } else {
       autoCapture.active = false;
@@ -403,6 +480,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Clear seen m3u8s between episodes so the next capture is detected fresh
     seenM3u8.clear();
     subtitlesSent.clear();
+    sendResponse({ ok: true });
+  } else if (msg.type === "setEpisodeContext") {
+    // Content script reports which episode is playing (for DOM-based sites like brocoflix)
+    const tabId = sender.tab?.id;
+    if (tabId != null) {
+      episodeContextByTab.set(tabId, {
+        show_name: msg.show_name || "",
+        season: msg.season ?? null,
+        episode: msg.episode ?? null,
+      });
+    }
     sendResponse({ ok: true });
   }
   return true;

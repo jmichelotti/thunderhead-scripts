@@ -175,9 +175,11 @@ document.getElementById("clearBtn").addEventListener("click", () => {
 // --- Auto-capture controls ---
 
 const acSection = document.getElementById("autoCapture");
-const acSeason = document.getElementById("acSeason");
+const acSite = document.getElementById("acSite");
+const acSeasonInput = document.getElementById("acSeasonInput");
 const acFromEp = document.getElementById("acFromEp");
 const acToEp = document.getElementById("acToEp");
+const acServerInput = document.getElementById("acServerInput");
 const acStartBtn = document.getElementById("acStartBtn");
 const acStopBtn = document.getElementById("acStopBtn");
 const acIdle = document.getElementById("acIdle");
@@ -185,9 +187,21 @@ const acRunning = document.getElementById("acRunning");
 const acIdleStatus = document.getElementById("acIdleStatus");
 const acRunStatus = document.getElementById("acRunStatus");
 
-let currentTabSeason = null;
+const SUPPORTED_SITES = ["1movies.bz", "brocoflix.xyz"];
 
-// Parse season from the active tab's URL hash (#ep=season,episode)
+// Prevent auto-fill from clobbering user-edited season input
+let acSeasonDirty = false;
+acSeasonInput.addEventListener("input", () => { acSeasonDirty = true; });
+
+function getSiteFromUrl(url) {
+  if (!url) return null;
+  for (const site of SUPPORTED_SITES) {
+    if (url.includes(site)) return site;
+  }
+  return null;
+}
+
+// Parse season from 1movies.bz URL hash (#ep=season,episode)
 function parseSeasonFromUrl(url) {
   if (!url) return null;
   const match = url.match(/#ep=(\d+),(\d+)/);
@@ -199,20 +213,24 @@ function updateAutoCaptureUI() {
     const tab = tabs[0];
     if (!tab) return;
 
-    const season = parseSeasonFromUrl(tab.url);
+    const site = getSiteFromUrl(tab.url);
     const serverUp = document.getElementById("serverStatus").classList.contains("server-up");
 
-    if (season !== null && serverUp) {
-      currentTabSeason = season;
+    if (site && serverUp) {
       acSection.classList.remove("hidden");
-      acSeason.textContent = `Season ${season}`;
+      acSite.textContent = site;
+
+      // Auto-fill season from URL hash on 1movies.bz (only if user hasn't manually edited it)
+      if (site === "1movies.bz" && !acSeasonDirty) {
+        const season = parseSeasonFromUrl(tab.url);
+        if (season !== null) acSeasonInput.value = season;
+      }
     } else {
       acSection.classList.add("hidden");
-      currentTabSeason = null;
     }
   });
 
-  // Check auto-capture state from background
+  // Sync running state from background
   chrome.runtime.sendMessage({ type: "getAutoCaptureState" }, (state) => {
     if (!state) return;
 
@@ -222,9 +240,7 @@ function updateAutoCaptureUI() {
       acIdle.style.display = "none";
       acRunning.style.display = "";
       const current = state.currentEp || state.startEp;
-      const total = state.endEp - state.startEp + 1;
-      const done = current - state.startEp;
-      acRunStatus.textContent = `Capturing EP ${current} of ${state.startEp}–${state.endEp}...`;
+      acRunStatus.textContent = `EP ${current} of ${state.startEp}–${state.endEp}...`;
       if (state.doneCount !== undefined) {
         acRunStatus.textContent = `EP ${current} of ${state.startEp}–${state.endEp} (${state.doneCount} captured)`;
       }
@@ -243,10 +259,15 @@ function updateAutoCaptureUI() {
 }
 
 acStartBtn.addEventListener("click", () => {
-  if (currentTabSeason === null) return;
-
+  const season = parseInt(acSeasonInput.value, 10);
   const startEp = parseInt(acFromEp.value, 10);
   const endEp = parseInt(acToEp.value, 10);
+
+  if (!season || season < 1) {
+    acIdleStatus.textContent = "Enter a season number";
+    acIdleStatus.className = "ac-status error";
+    return;
+  }
   if (!startEp || !endEp || startEp > endEp || startEp < 1) {
     acIdleStatus.textContent = "Invalid episode range";
     acIdleStatus.className = "ac-status error";
@@ -256,11 +277,14 @@ acStartBtn.addEventListener("click", () => {
   acStartBtn.disabled = true;
   acIdleStatus.textContent = "Starting...";
 
+  const serverNum = parseInt(acServerInput.value, 10) || 1;
+
   chrome.runtime.sendMessage({
     type: "startAutoCapture",
-    season: currentTabSeason,
+    season,
     startEp,
     endEp,
+    serverNum,
   }, (resp) => {
     acStartBtn.disabled = false;
     if (resp && resp.ok) {
@@ -271,6 +295,42 @@ acStartBtn.addEventListener("click", () => {
       acIdleStatus.textContent = resp?.error || "Failed to start";
       acIdleStatus.className = "ac-status error";
     }
+  });
+});
+
+// --- DOM Inspector ---
+
+const inspectBtn = document.getElementById("inspectBtn");
+const copyInspectBtn = document.getElementById("copyInspectBtn");
+const inspectResults = document.getElementById("inspectResults");
+const inspectStatus = document.getElementById("inspectStatus");
+
+inspectBtn.addEventListener("click", () => {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs[0];
+    if (!tab) return;
+
+    inspectStatus.textContent = "inspecting...";
+    inspectResults.style.display = "none";
+    copyInspectBtn.style.display = "none";
+
+    chrome.tabs.sendMessage(tab.id, { type: "inspectDom" }, (resp) => {
+      if (chrome.runtime.lastError || !resp) {
+        inspectStatus.textContent = "error — are you on a streaming page?";
+        return;
+      }
+      inspectStatus.textContent = "";
+      inspectResults.textContent = resp.result;
+      inspectResults.style.display = "block";
+      copyInspectBtn.style.display = "";
+    });
+  });
+});
+
+copyInspectBtn.addEventListener("click", () => {
+  navigator.clipboard.writeText(inspectResults.textContent).then(() => {
+    copyInspectBtn.textContent = "Copied!";
+    setTimeout(() => { copyInspectBtn.textContent = "Copy"; }, 1500);
   });
 });
 

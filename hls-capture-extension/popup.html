@@ -229,7 +229,7 @@
       color: #9ca3af;
     }
     .ac-inputs input[type="number"] {
-      width: 50px;
+      width: 46px;
       padding: 3px 6px;
       background: #374151;
       color: #e0e0e0;
@@ -237,6 +237,46 @@
       border-radius: 4px;
       font-size: 12px;
       text-align: center;
+    }
+
+    /* DOM inspector */
+    .inspector-bar {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin: 8px 0 4px 0;
+      padding-top: 8px;
+      border-top: 1px solid #2d2d4a;
+    }
+    .btn-inspect {
+      background: #1e3a5f;
+      color: #93c5fd;
+      font-size: 11px;
+      padding: 3px 8px;
+    }
+    .btn-inspect:hover { background: #1e4976; }
+    .btn-copy-inspect {
+      background: #1e3a2a;
+      color: #6ee7b7;
+      font-size: 11px;
+      padding: 3px 8px;
+      display: none;
+    }
+    .btn-copy-inspect:hover { background: #1a4a35; }
+    #inspectResults {
+      display: none;
+      margin: 4px 0 8px 0;
+      padding: 8px;
+      background: #0f172a;
+      border: 1px solid #2d2d4a;
+      border-radius: 4px;
+      font-family: "Consolas", "Courier New", monospace;
+      font-size: 10px;
+      color: #94a3b8;
+      white-space: pre;
+      overflow-x: auto;
+      max-height: 200px;
+      overflow-y: auto;
     }
     .ac-actions {
       display: flex;
@@ -285,14 +325,18 @@
   <div id="autoCapture" class="auto-capture hidden">
     <div class="ac-header">
       <span class="ac-title">Auto-Capture</span>
-      <span id="acSeason" class="ac-season"></span>
+      <span id="acSite" class="ac-season"></span>
     </div>
     <div id="acIdle">
       <div class="ac-inputs">
-        <label>From EP</label>
+        <label>S</label>
+        <input type="number" id="acSeasonInput" min="1" value="1">
+        <label>EP</label>
         <input type="number" id="acFromEp" min="1" value="1">
-        <label>To EP</label>
+        <label>–</label>
         <input type="number" id="acToEp" min="1" value="10">
+        <label>Srv</label>
+        <input type="number" id="acServerInput" min="1" max="9" value="1" title="Server number (1=default)">
       </div>
       <div class="ac-actions">
         <button id="acStartBtn" class="btn-auto-capture">Auto-capture</button>
@@ -306,6 +350,13 @@
       </div>
     </div>
   </div>
+  <div class="inspector-bar">
+    <button id="inspectBtn" class="btn-inspect">Inspect Page DOM</button>
+    <button id="copyInspectBtn" class="btn-copy-inspect">Copy</button>
+    <span id="inspectStatus" style="font-size:11px; color:#6b7280;"></span>
+  </div>
+  <pre id="inspectResults"></pre>
+
   <div id="pending"></div>
   <div id="downloads" class="scrollable">
     <div class="empty">No downloads yet. Browse to a video page and press play.</div>

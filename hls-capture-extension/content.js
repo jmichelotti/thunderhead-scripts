@@ -160,7 +160,7 @@ style.textContent = `
 `;
 document.head.appendChild(style);
 
-// --- Auto-capture overlay & page-reload-based loop ---
+// ========= AUTO-CAPTURE OVERLAY & HELPERS =========
 
 const AC_OVERLAY_ID = "hls-auto-capture-overlay";
 let autoCaptureAborted = false;
@@ -207,15 +207,233 @@ function waitForEpisodeDone(timeoutMs) {
   });
 }
 
-// Called on every page load — if auto-capture is active for this tab, run the current episode step
-function checkAutoCaptureOnLoad() {
-  chrome.runtime.sendMessage({ type: "checkAutoCapture" }, (state) => {
-    if (chrome.runtime.lastError || !state || !state.active) return;
-    runAutoCaptureStep(state);
+// ========= SITE DETECTION & DOM HELPERS =========
+
+function getCurrentSite() {
+  const host = window.location.hostname;
+  if (host.includes("brocoflix.xyz")) return "brocoflix.xyz";
+  if (host.includes("1movies.bz")) return "1movies.bz";
+  return null;
+}
+
+// Find the main embed iframe on the page
+function getEmbedIframe() {
+  return document.querySelector("#video-player iframe")
+    ?? document.querySelector("iframe[src*='vidsrc']")
+    ?? document.querySelector("iframe[src*='embed']")
+    ?? document.querySelector("iframe");
+}
+
+// Force the embed iframe to start playing by setting autoPlay=true in its src.
+// This bypasses isTrusted checks on the site's play button handler.
+function triggerIframeAutoPlay() {
+  const iframe = getEmbedIframe();
+  if (!iframe?.src) return false;
+  const src = iframe.src;
+  if (src.toLowerCase().includes("autoplay=true")) return true; // already set
+  if (src.toLowerCase().includes("autoplay=false")) {
+    iframe.src = src.replace(/autoPlay=false/i, "autoPlay=true");
+    return true;
+  }
+  // No autoPlay param present — append it
+  iframe.src = src + (src.includes("?") ? "&" : "?") + "autoPlay=true";
+  return true;
+}
+
+// Wait for a DOM element matching selector to appear (MutationObserver-based)
+function waitForElement(selector, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const el = document.querySelector(selector);
+    if (el) return resolve(el);
+
+    const observer = new MutationObserver(() => {
+      const found = document.querySelector(selector);
+      if (found) {
+        observer.disconnect();
+        resolve(found);
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => {
+      observer.disconnect();
+      resolve(null);
+    }, timeoutMs);
   });
 }
 
-async function runAutoCaptureStep(state) {
+// Extract the show title from the page DOM
+function getShowTitleFromDom() {
+  const selectors = [
+    "#details-container h1",
+    "#details-container .title",
+    "#details-container [class*='title']",
+    "h1",
+  ];
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (el?.textContent?.trim()) return el.textContent.trim();
+  }
+  // Last resort: strip site name suffix from document title
+  return document.title.replace(/\s*[\|–\-].*$/, "").trim();
+}
+
+// ========= BROCOFLIX EPISODE TRACKING =========
+
+// Listen for episode card / play button / server button clicks on brocoflix.
+function setupBrocoflixListeners() {
+  document.addEventListener("click", (e) => {
+    // --- Episode play button clicked ---
+    // .episode-play-button is inside each .episode-card; clicking it starts playback.
+    const playBtn = e.target.closest(".episode-play-button");
+    if (playBtn) {
+      const card = playBtn.closest(".episode-card");
+      const season  = parseInt(card?.dataset.season,  10) || null;
+      const episode = parseInt(card?.dataset.episode, 10) || null;
+      const showName = getShowTitleFromDom();
+      if (season && episode) {
+        chrome.runtime.sendMessage({ type: "setEpisodeContext", show_name: showName, season, episode });
+      }
+      return;
+    }
+
+    // --- Episode card clicked (without hitting the play button) ---
+    const card = e.target.closest(".episode-card");
+    if (card) {
+      const season  = parseInt(card.dataset.season,  10) || null;
+      const episode = parseInt(card.dataset.episode, 10) || null;
+      const showName = getShowTitleFromDom();
+      if (season && episode) {
+        chrome.runtime.sendMessage({ type: "setEpisodeContext", show_name: showName, season, episode });
+      }
+      return;
+    }
+
+    // --- Server button clicked ---
+    // When the user switches servers, clear seenM3u8 so the new server's
+    // m3u8 URL (which may share a CDN with the previous server) can be
+    // captured fresh.
+    const serverBtn = e.target.closest(".server-button");
+    if (serverBtn) {
+      chrome.runtime.sendMessage({ type: "clearEpisodeState" });
+    }
+  }, true); // capture phase fires before page handlers
+}
+
+// ========= AUTO-CAPTURE: CLICK-CARD STRATEGY (brocoflix) =========
+
+// Navigate between episodes by clicking .episode-card elements in the DOM.
+// No page reload needed — the site is a SPA and updates the player in-place.
+async function runAutoCaptureClickCard(state) {
+  const { season, currentEp, startEp, endEp } = state;
+  autoCaptureAborted = false;
+
+  showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp}`);
+
+  // Ensure the correct season is selected in the dropdown
+  const seasonSelect = document.querySelector("#season-select");
+  if (seasonSelect && parseInt(seasonSelect.value, 10) !== season) {
+    seasonSelect.value = String(season);
+    seasonSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    await sleep(2000);
+    if (autoCaptureAborted) return;
+  }
+
+  // Wait for episode cards / play buttons to be present in the DOM
+  await waitForElement(".episode-play-button", 8000);
+  if (autoCaptureAborted) return;
+
+  // Find the episode card for the target episode.
+  // Primary:  data-season + data-episode attributes on .episode-card
+  // Fallback: Nth .episode-card (1-indexed, assuming the list is in episode order)
+  let card = document.querySelector(`.episode-card[data-season="${season}"][data-episode="${currentEp}"]`)
+          || document.querySelector(`.episode-card[data-episode="${currentEp}"]`);
+
+  if (!card) {
+    const allCards = document.querySelectorAll(".episode-card");
+    card = allCards[currentEp - 1] || null;
+    if (card) showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (index fallback)`);
+  }
+
+  if (card) {
+    // Set episode context before clicking so it's in place when the m3u8 fires
+    const showName = getShowTitleFromDom();
+    chrome.runtime.sendMessage({ type: "setEpisodeContext", show_name: showName, season, episode: currentEp });
+    chrome.runtime.sendMessage({ type: "autoCaptureClickedPlay", season, episode: currentEp });
+
+    // Scroll the card into view and click it to navigate to the target episode.
+    // Clicking the card (not the play button) loads the iframe with the correct
+    // episode at autoPlay=false, which we'll then upgrade to autoPlay=true below.
+    card.scrollIntoView({ block: "nearest", behavior: "instant" });
+    await sleep(200);
+    card.click();
+    await sleep(600);
+    if (autoCaptureAborted) return;
+
+    // Click the preferred server button (always visible, 1-indexed).
+    const serverNum = state.serverNum || 1;
+    const allServerBtns = document.querySelectorAll(".server-button");
+    const serverBtn = allServerBtns[serverNum - 1];
+    if (serverBtn && !serverBtn.classList.contains("active")) {
+      serverBtn.click();
+      await sleep(600); // wait for iframe src to update to the selected server
+      if (autoCaptureAborted) return;
+    }
+
+    // Trigger playback by directly setting autoPlay=true on the iframe src.
+    // Programmatic .click() on .episode-play-button is blocked by isTrusted checks;
+    // iframe src manipulation bypasses this entirely.
+    triggerIframeAutoPlay();
+  } else {
+    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} – card not found (${document.querySelectorAll(".episode-card").length} cards visible)`);
+  }
+
+  // Wait for m3u8 capture confirmation (max 15s)
+  let captured = await waitForEpisodeDone(15000);
+  autoCaptureResolveEpisode = null;
+  if (autoCaptureAborted) return;
+
+  // Retry once if not captured
+  if (!captured && card) {
+    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (retrying...)`);
+    chrome.runtime.sendMessage({ type: "clearEpisodeState" });
+    card.click();
+    await sleep(600);
+    triggerIframeAutoPlay();
+    captured = await waitForEpisodeDone(15000);
+    autoCaptureResolveEpisode = null;
+  }
+
+  if (autoCaptureAborted) return;
+
+  if (!captured) {
+    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (skipped)`);
+    await sleep(1000);
+  }
+
+  // Ask background to advance; on success, click the next card directly (no reload)
+  chrome.runtime.sendMessage({ type: "autoCaptureAdvance" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) return;
+
+    if (resp.hasNext) {
+      runAutoCaptureClickCard({
+        season: resp.season,
+        currentEp: resp.nextEp,
+        startEp: resp.startEp,
+        endEp: resp.endEp,
+        serverNum: resp.serverNum,
+      });
+    } else {
+      showAutoCaptureOverlay("Auto-capture complete!");
+      setTimeout(removeAutoCaptureOverlay, 3000);
+    }
+  });
+}
+
+// ========= AUTO-CAPTURE: HASH-RELOAD STRATEGY (1movies.bz) =========
+
+// Navigate between episodes by changing location.hash and reloading the page.
+// Required for sites that only load subtitle VTT files on a full page init.
+async function runAutoCaptureHashReload(state) {
   const { season, currentEp, endEp, startEp } = state;
   autoCaptureAborted = false;
 
@@ -259,12 +477,11 @@ async function runAutoCaptureStep(state) {
 
   if (autoCaptureAborted) return;
 
-  // Ask background to advance to next episode
+  // Ask background to advance; navigate to next episode with a full page reload
   chrome.runtime.sendMessage({ type: "autoCaptureAdvance" }, (resp) => {
     if (chrome.runtime.lastError || !resp) return;
 
     if (resp.hasNext) {
-      // Navigate to next episode with full page reload so subtitles load fresh
       location.hash = `#ep=${resp.season},${resp.nextEp}`;
       location.reload();
     } else {
@@ -274,10 +491,146 @@ async function runAutoCaptureStep(state) {
   });
 }
 
+// ========= AUTO-CAPTURE DISPATCHER =========
+
+// Dispatches to the correct strategy based on siteConfig.navStrategy.
+// Called on every page load (for hash-reload sites) and directly for click-card sites.
+function runAutoCaptureStep(state) {
+  if (state.siteConfig?.navStrategy === "click-card") {
+    runAutoCaptureClickCard(state);
+  } else {
+    runAutoCaptureHashReload(state);
+  }
+}
+
+// Called on every page load — if auto-capture is active for this tab, run the current episode step
+function checkAutoCaptureOnLoad() {
+  chrome.runtime.sendMessage({ type: "checkAutoCapture" }, (state) => {
+    if (chrome.runtime.lastError || !state || !state.active) return;
+    runAutoCaptureStep(state);
+  });
+}
+
+// ========= DOM INSPECTOR =========
+
+function inspectPageDom() {
+  const lines = [];
+
+  lines.push(`URL:   ${window.location.href}`);
+  lines.push(`Title: ${document.title}`);
+  lines.push("");
+
+  // #details-container — find the show title
+  const dc = document.querySelector("#details-container");
+  if (dc) {
+    lines.push("#details-container headings/title elements:");
+    const titleEls = dc.querySelectorAll("h1, h2, h3, [class*='title'], [class*='name'], [class*='heading']");
+    if (titleEls.length) {
+      titleEls.forEach((el) => {
+        const text = el.textContent.trim().slice(0, 120);
+        lines.push(`  <${el.tagName.toLowerCase()} class="${el.className}">`);
+        if (text) lines.push(`    "${text}"`);
+      });
+    } else {
+      // Fallback: just show raw text
+      const text = dc.textContent.trim().slice(0, 200);
+      lines.push(`  (no headings found) text: "${text}"`);
+    }
+  } else {
+    lines.push("#details-container: NOT FOUND");
+  }
+  lines.push("");
+
+  // #video-player — find any buttons/play elements inside it
+  const vp = document.querySelector("#video-player");
+  if (vp) {
+    lines.push("#video-player contents:");
+    const vpEls = vp.querySelectorAll("button, [role='button'], [class*='btn'], [class*='play'], [class*='watch'], [class*='server'], iframe");
+    if (vpEls.length) {
+      vpEls.forEach((el) => {
+        const text = el.tagName === "IFRAME"
+          ? `src="${el.src.slice(0, 80)}"`
+          : el.textContent.trim().slice(0, 80);
+        lines.push(`  <${el.tagName.toLowerCase()} id="${el.id}" class="${el.className}">`);
+        if (text) lines.push(`    ${text}`);
+      });
+    } else {
+      lines.push("  (empty or not yet loaded)");
+    }
+  } else {
+    lines.push("#video-player: NOT FOUND");
+  }
+  lines.push("");
+
+  // All <button> elements on the page
+  lines.push("ALL BUTTONS:");
+  const buttons = document.querySelectorAll("button");
+  if (buttons.length === 0) {
+    lines.push("  none");
+  } else {
+    buttons.forEach((el) => {
+      const text = el.textContent.trim().slice(0, 80);
+      lines.push(`  id="${el.id}" class="${el.className}"`);
+      if (text) lines.push(`    text: "${text}"`);
+    });
+  }
+  lines.push("");
+
+  // Elements with play/watch/server in class or id
+  lines.push("PLAY / WATCH / SERVER ELEMENTS:");
+  const pwEls = document.querySelectorAll(
+    "[class*='play'], [class*='watch'], [class*='server'], [id*='play'], [id*='watch']"
+  );
+  if (pwEls.length === 0) {
+    lines.push("  none found");
+  } else {
+    pwEls.forEach((el) => {
+      const text = el.textContent.trim().slice(0, 80);
+      lines.push(`  <${el.tagName.toLowerCase()} id="${el.id}" class="${el.className}">`);
+      if (text) lines.push(`    text: "${text}"`);
+    });
+  }
+  lines.push("");
+
+  // Episode cards
+  lines.push("EPISODE CARDS (first 3):");
+  const cards = document.querySelectorAll(".episode-card");
+  if (cards.length === 0) {
+    lines.push("  none found — is the episode grid loaded?");
+  } else {
+    Array.from(cards).slice(0, 3).forEach((card) => {
+      lines.push(`  data-season="${card.dataset.season}" data-episode="${card.dataset.episode}" class="${card.className}"`);
+      const subtitle = card.querySelector("[class*='title'], [class*='name'], p, span")?.textContent.trim().slice(0, 60);
+      if (subtitle) lines.push(`    "${subtitle}"`);
+    });
+    lines.push(`  (${cards.length} total cards)`);
+  }
+  lines.push("");
+
+  // Season select
+  const ss = document.querySelector("#season-select");
+  if (ss) {
+    const opts = Array.from(ss.options).map((o) => o.value).join(", ");
+    lines.push(`#season-select: value="${ss.value}"  options=[${opts}]`);
+  } else {
+    lines.push("#season-select: NOT FOUND");
+  }
+
+  return lines.join("\n");
+}
+
+// ========= INIT =========
+
+// Set up site-specific DOM listeners
+if (getCurrentSite() === "brocoflix.xyz") {
+  setupBrocoflixListeners();
+}
+
 // On content script load, check if auto-capture is in progress for this tab
 checkAutoCaptureOnLoad();
 
-// Listen for messages from background.js
+// ========= MESSAGE LISTENER =========
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "showCaptureDialog") {
     showDialog(msg);
@@ -286,9 +639,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     updateDialog(msg);
     sendResponse({ ok: true });
   } else if (msg.type === "beginAutoCapture") {
-    // First episode: set hash and reload to get a fresh page with subtitles
-    location.hash = `#ep=${msg.season},${msg.startEp}`;
-    location.reload();
+    if (msg.siteConfig?.navStrategy === "click-card") {
+      // SPA site — no reload needed, run the loop directly
+      runAutoCaptureClickCard({
+        season: msg.season,
+        currentEp: msg.startEp,
+        startEp: msg.startEp,
+        endEp: msg.endEp,
+        serverNum: msg.serverNum,
+      });
+    } else {
+      // Hash-reload: navigate to first episode via hash change + reload
+      location.hash = `#ep=${msg.season},${msg.startEp}`;
+      location.reload();
+    }
     sendResponse({ ok: true });
   } else if (msg.type === "stopAutoCapture") {
     autoCaptureAborted = true;
@@ -304,6 +668,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       autoCaptureResolveEpisode = null;
     }
     sendResponse({ ok: true });
+  } else if (msg.type === "inspectDom") {
+    sendResponse({ result: inspectPageDom() });
   }
   return true;
 });

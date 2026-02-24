@@ -80,6 +80,17 @@ def lookup_show(title_guess: str) -> Optional[Dict[str, str]]:
     if meta:
         return meta
 
+    # If title ends with digits (site slug artifact, e.g. "Paradise4" -> "Paradise"),
+    # retry without the trailing number
+    stripped = re.sub(r"\s*\d+$", "", title_guess).strip()
+    if stripped and stripped != title_guess:
+        meta = try_omdb({"apikey": OMDB_API_KEY, "t": stripped, "type": "series"})
+        if meta:
+            return meta
+        meta = try_omdb({"apikey": OMDB_API_KEY, "s": stripped, "type": "series"})
+        if meta:
+            return meta
+
     return None
 
 
@@ -116,6 +127,41 @@ def parse_show_from_url(page_url: str) -> dict:
         result["episode"] = int(ep_match.group(2))
 
     return result
+
+
+def parse_episode_info(body: dict, page_url: str) -> dict:
+    """
+    Extract show_name, season, episode from request body or page URL.
+
+    First tries body fields (show_name, season, episode) sent by the extension
+    for DOM-based sites like brocoflix.xyz where the URL never changes.
+    Falls back to URL parsing for URL-based sites like 1movies.bz.
+
+    Returns: {show_slug, show_name, season, episode}
+    """
+    show_name = (body.get("show_name") or "").strip()
+    season = body.get("season")
+    episode = body.get("episode")
+
+    # If the extension provided all three fields directly, use them
+    if show_name and season is not None and episode is not None:
+        try:
+            season = int(season)
+            episode = int(episode)
+            show_slug = re.sub(r"[^a-z0-9]+", "-", show_name.lower()).strip("-")
+            return {"show_slug": show_slug, "show_name": show_name,
+                    "season": season, "episode": episode}
+        except (ValueError, TypeError):
+            pass
+
+    # Fall back to URL parsing (1movies.bz slug format)
+    url_info = parse_show_from_url(page_url)
+    return {
+        "show_slug": url_info.get("show_slug", ""),
+        "show_name": show_name or url_info.get("show_name", ""),
+        "season":    season  if season  is not None else url_info.get("season"),
+        "episode":   episode if episode is not None else url_info.get("episode"),
+    }
 
 
 # ========= DOWNLOAD PROGRESS TRACKING =========
@@ -598,7 +644,7 @@ class HLSHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "error", "message": "missing subtitle_url"}, 400)
             return
 
-        info = parse_show_from_url(page_url)
+        info = parse_episode_info(body, page_url)
         if not info["show_slug"] or info["season"] is None or info["episode"] is None:
             self._send_json({"status": "skipped", "message": "cannot parse episode"})
             return
@@ -630,7 +676,7 @@ class HLSHandler(BaseHTTPRequestHandler):
             return
 
         # Parse show info
-        info = parse_show_from_url(page_url)
+        info = parse_episode_info(body, page_url)
         if not info["show_name"] or info["season"] is None or info["episode"] is None:
             self._send_json({
                 "status": "error",
@@ -696,8 +742,8 @@ class HLSHandler(BaseHTTPRequestHandler):
         print(f"  Captured m3u8: {m3u8_url[:100]}...", flush=True)
         print(f"  Page URL:      {page_url}", flush=True)
 
-        # Parse show info from page URL
-        info = parse_show_from_url(page_url)
+        # Parse show info from body fields or page URL
+        info = parse_episode_info(body, page_url)
         print(f"  Parsed:        {info}", flush=True)
 
         if not info["show_name"] or info["season"] is None or info["episode"] is None:
