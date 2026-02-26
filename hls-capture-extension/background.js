@@ -64,6 +64,7 @@ let autoCapture = {
   totalCount: 0,
   siteConfig: null,
   serverNum: 1,
+  graceUntil: 0,  // timestamp: auto-confirm still fires during grace period after last ep
 };
 
 // ========= NETWORK INTERCEPTION =========
@@ -101,8 +102,11 @@ chrome.webRequest.onBeforeRequest.addListener(
 
       const pageUrl = tab?.url || "";
 
-      // Auto-capture mode: skip pending queue, auto-confirm immediately
-      if (autoCapture.active && tabId === autoCapture.tabId) {
+      // Auto-capture mode: skip pending queue, auto-confirm immediately.
+      // Also fires during the grace period after the last episode, in case the
+      // video was slow to start and the content script timed out before the m3u8 fired.
+      if (tabId === autoCapture.tabId &&
+          (autoCapture.active || Date.now() < autoCapture.graceUntil)) {
         autoConfirmCapture(url, pageUrl, tabId);
         return;
       }
@@ -399,7 +403,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     autoCapture = {
       active: false, finished: false, tabId: null, season: null,
       startEp: null, endEp: null, currentEp: null, doneCount: 0,
-      totalCount: 0, siteConfig: null,
+      totalCount: 0, siteConfig: null, graceUntil: 0,
     };
     updateBadge();
     sendResponse({ ok: true });
@@ -463,6 +467,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     } else {
       autoCapture.active = false;
       autoCapture.finished = true;
+      // Grace period: keep auto-confirming for 15s in case the last episode's
+      // m3u8 fires after the content script already timed out and advanced.
+      autoCapture.graceUntil = Date.now() + 15000;
       updateBadge();
       sendResponse({ hasNext: false });
     }

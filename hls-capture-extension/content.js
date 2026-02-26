@@ -439,6 +439,11 @@ async function runAutoCaptureHashReload(state) {
 
   showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp}`);
 
+  // Set up the done-listener BEFORE the sleep so we don't miss autoCaptureEpisodeDone
+  // messages that arrive during page load (video can auto-play before we click play).
+  // Timeout = 4s sleep + 15s capture window.
+  const capturePromise = waitForEpisodeDone(19000);
+
   // Wait for page and player to fully initialize (subtitles load during this time)
   await sleep(4000);
   if (autoCaptureAborted) return;
@@ -454,8 +459,8 @@ async function runAutoCaptureHashReload(state) {
   let playBtn = document.querySelector("#player button.player-btn");
   if (playBtn) playBtn.click();
 
-  // Wait for m3u8 capture confirmation (max 15s)
-  let captured = await waitForEpisodeDone(15000);
+  // Wait for m3u8 capture confirmation (promise may already be resolved if video auto-played)
+  let captured = await capturePromise;
   autoCaptureResolveEpisode = null;
 
   if (autoCaptureAborted) return;

@@ -33,6 +33,15 @@ from urllib.parse import urlparse
 
 import requests
 
+try:
+    from langdetect import detect as _langdetect
+    from langdetect import DetectorFactory as _LangDetectFactory
+    from langdetect.lang_detect_exception import LangDetectException as _LangDetectException
+    _LangDetectFactory.seed = 0  # make results deterministic
+    _LANGDETECT_OK = True
+except ImportError:
+    _LANGDETECT_OK = False
+
 
 # ========= CONFIG =========
 
@@ -371,8 +380,12 @@ def vtt_to_srt(vtt_text: str) -> str:
     return "\n".join(output)
 
 
-def is_english_subtitle(text: str) -> bool:
-    """Heuristic: check if subtitle text is predominantly English."""
+def is_english_subtitle(text: str) -> tuple[bool, str]:
+    """
+    Heuristic: check if subtitle text is predominantly English.
+    Returns (accepted, reason) where reason is empty string on acceptance
+    or a short description of why it was rejected.
+    """
     # Extract just the dialogue lines (skip timestamps, cue numbers, headers)
     dialogue = []
     for line in text.splitlines():
@@ -388,22 +401,22 @@ def is_english_subtitle(text: str) -> bool:
         dialogue.append(line)
 
     if not dialogue:
-        return False
+        return False, "no dialogue lines"
 
     # Sample first 50 dialogue lines for better accuracy
     sample = " ".join(dialogue[:50])
     if not sample:
-        return False
+        return False, "empty sample"
 
     # Reject thumbnail sprite maps (VTT files with xywh= coordinates, not dialogue)
     if "xywh=" in sample or "thumbnails" in sample.lower():
-        return False
+        return False, "thumbnail sprite"
 
     # Check for UTF-8 mojibake (Latin text decoded as cp1252/latin1 then re-encoded)
     # e.g. "Ã©" (é), "Ã¨" (è), "Ã´" (ô), "Ã§" (ç) — common in French/Spanish/etc.
     mojibake_count = len(re.findall(r"Ã[\x80-\xbf]", sample))
     if mojibake_count > 2:
-        return False
+        return False, f"mojibake ({mojibake_count} hits)"
 
     # Check for CP1250/Latin-1 encoding corruption: characters in U+0080–U+00BF
     # (like ³ ¹ ¿ ¯ ± ¶) are Latin-1 supplement symbols that never appear in clean
@@ -411,13 +424,9 @@ def is_english_subtitle(text: str) -> bool:
     # become these symbols (e.g. ł→³, ż→¿, ą→¹). More than 2 = encoding corruption.
     latin1_symbols = sum(1 for c in sample if 0x80 <= ord(c) <= 0xBF)
     if latin1_symbols > 2:
-        return False
+        return False, f"latin1 symbols ({latin1_symbols})"
 
     # Check for actual Unicode accented Latin characters (common in non-English European)
-    # Only count real accented letters (À-ö, ø-ÿ, etc.), not stray bytes from
-    # mis-decoded symbols like ♪ (U+266A) whose UTF-8 bytes E2/99/AA become â/\x99/ª
-    # when decoded as latin-1.
-    # Focus on the most common accented ranges used in European languages:
     ACCENTED_RANGES = (
         (0x00C0, 0x00D6),  # À-Ö
         (0x00D8, 0x00F6),  # Ø-ö
@@ -431,7 +440,7 @@ def is_english_subtitle(text: str) -> bool:
     )
     alpha = sum(1 for c in sample if c.isalpha())
     if alpha > 0 and accented / alpha > 0.05:
-        return False
+        return False, f"accented ratio ({accented}/{alpha} = {accented/alpha:.2f})"
 
     # Detect non-English by common foreign words/patterns
     sample_lower = sample.lower()
@@ -451,18 +460,31 @@ def is_english_subtitle(text: str) -> bool:
     foreign_hits = sum(
         len(re.findall(pat, sample_lower)) for pat in foreign_markers
     )
-    # English text might have occasional "the" matching "les" etc., but
-    # a high density of foreign words is a clear signal
     if foreign_hits > 8:
-        return False
+        return False, f"foreign words ({foreign_hits} hits)"
 
-    # Basic ASCII ratio check as final filter
+    # Basic ASCII ratio check
     ascii_letters = sum(1 for c in sample if c.isascii() and c.isalpha())
     all_letters = sum(1 for c in sample if c.isalpha())
     if all_letters == 0:
-        return False
+        return False, "no letters"
+    ascii_ratio = ascii_letters / all_letters
+    if ascii_ratio <= 0.9:
+        return False, f"ascii ratio ({ascii_ratio:.2f})"
 
-    return ascii_letters / all_letters > 0.9
+    # Final check: langdetect confirms the language is actually English.
+    # Catches Latin-script languages (Fijian, Indonesian, Swahili, Turkish, etc.)
+    # that pass all character-based checks above.
+    # Falls through gracefully if langdetect is not installed or sample is too short.
+    if _LANGDETECT_OK:
+        try:
+            detected = _langdetect(sample)
+            if detected != "en":
+                return False, f"langdetect={detected}"
+        except _LangDetectException:
+            pass  # too short or ambiguous — trust the other checks
+
+    return True, ""
 
 
 def download_subtitle(subtitle_url: str, ep_key: str):
@@ -498,8 +520,9 @@ def download_subtitle(subtitle_url: str, ep_key: str):
         content = resp.text
 
         # Check if English before saving
-        if not is_english_subtitle(content):
-            print(f"  Subtitle rejected (not English): {subtitle_url[:80]}...", flush=True)
+        accepted, reason = is_english_subtitle(content)
+        if not accepted:
+            print(f"  Subtitle rejected ({reason}): {subtitle_url[:80]}...", flush=True)
             return
 
         # Claim this episode under lock so only the first English subtitle wins
