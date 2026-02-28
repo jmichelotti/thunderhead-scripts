@@ -65,6 +65,8 @@ let autoCapture = {
   siteConfig: null,
   serverNum: 1,
   graceUntil: 0,  // timestamp: auto-confirm still fires during grace period after last ep
+  epoch: 0,              // increments each episode advance; used to detect stale done-signals
+  episodeDoneSent: false, // true after first done-signal for current epoch (prevents duplicates)
 };
 
 // ========= NETWORK INTERCEPTION =========
@@ -93,7 +95,10 @@ chrome.webRequest.onBeforeRequest.addListener(
     if (!url.includes(".m3u8")) return;
 
     // Skip if already pending or confirmed
-    if (seenM3u8.has(url)) return;
+    if (seenM3u8.has(url)) {
+      if (autoCapture.active) console.log(`[AC] m3u8 blocked by seenM3u8 (ep ${autoCapture.currentEp}, epoch ${autoCapture.epoch}): ${url.slice(0, 80)}`);
+      return;
+    }
     seenM3u8.add(url);
 
     // Get the tab URL for context
@@ -107,6 +112,7 @@ chrome.webRequest.onBeforeRequest.addListener(
       // video was slow to start and the content script timed out before the m3u8 fired.
       if (tabId === autoCapture.tabId &&
           (autoCapture.active || Date.now() < autoCapture.graceUntil)) {
+        console.log(`[AC] m3u8 intercepted for ep ${autoCapture.currentEp} (epoch ${autoCapture.epoch}): ${url.slice(0, 80)}`);
         autoConfirmCapture(url, pageUrl, tabId);
         return;
       }
@@ -307,6 +313,12 @@ function updateBadge() {
 // ========= AUTO-CAPTURE =========
 
 async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
+  // Snapshot the epoch so we can detect if we've advanced past this episode
+  // by the time the download + delay finishes
+  const epoch = autoCapture.epoch;
+  const ep = autoCapture.currentEp;
+  console.log(`[AC] autoConfirmCapture START ep=${ep} epoch=${epoch} url=${m3u8Url.slice(0, 80)}`);
+
   const capture = {
     m3u8_url: m3u8Url,
     page_url: pageUrl,
@@ -322,15 +334,29 @@ async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
 
   updateBadge();
   await sendToServer(capture);
+  console.log(`[AC] autoConfirmCapture server responded ep=${ep} status=${capture.status}`);
 
   // Wait a moment for any remaining subtitle requests to arrive at the server
   // (subtitles load on page init but some may still be in-flight)
   await new Promise((r) => setTimeout(r, 2000));
 
+  // Guard: only send done-signal if we're still on the same episode AND
+  // haven't already sent one for this episode.  Multiple m3u8 URLs per episode
+  // (ad pre-rolls, quality variants, CDN retries) each trigger this function,
+  // but only the first should fire the done-signal.  Without this guard, a
+  // stale done-signal from episode N can resolve episode N+1's
+  // waitForEpisodeDone, causing it to be skipped.
+  if (epoch !== autoCapture.epoch || autoCapture.episodeDoneSent) {
+    console.log(`[AC] autoConfirmCapture SUPPRESSED ep=${ep} snapshotEpoch=${epoch} currentEpoch=${autoCapture.epoch} doneSent=${autoCapture.episodeDoneSent}`);
+    return;
+  }
+  autoCapture.episodeDoneSent = true;
+
   // Notify the content script that this episode is done
   autoCapture.doneCount++;
   updateBadge();
 
+  console.log(`[AC] autoConfirmCapture DONE-SIGNAL ep=${ep} epoch=${epoch}`);
   notifyTab(tabId, {
     type: "autoCaptureEpisodeDone",
     season: autoCapture.season,
@@ -353,6 +379,8 @@ function startAutoCapture(season, startEp, endEp, tabId, tabUrl, serverNum) {
     totalCount: endEp - startEp + 1,
     siteConfig,
     serverNum: serverNum || 1,
+    epoch: 0,
+    episodeDoneSent: false,
   };
 
   // Clear seen state so first episode's m3u8 and subtitles are detected fresh
@@ -404,6 +432,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       active: false, finished: false, tabId: null, season: null,
       startEp: null, endEp: null, currentEp: null, doneCount: 0,
       totalCount: 0, siteConfig: null, graceUntil: 0,
+      epoch: 0, episodeDoneSent: false,
     };
     updateBadge();
     sendResponse({ ok: true });
@@ -450,10 +479,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   } else if (msg.type === "autoCaptureAdvance") {
     // Content script finished an episode, advance to next or complete
     if (autoCapture.active && autoCapture.currentEp < autoCapture.endEp) {
+      const prevEp = autoCapture.currentEp;
       autoCapture.currentEp++;
-      // Clear seen state so next episode's m3u8 and subtitles are detected fresh
-      seenM3u8.clear();
-      subtitlesSent.clear();
+      autoCapture.epoch++;              // new epoch so stale done-signals are ignored
+      autoCapture.episodeDoneSent = false;
+      // DO NOT clear seenM3u8 here — stale m3u8 requests from the old episode's
+      // player teardown may still be in-flight.  Keeping them in seenM3u8 blocks
+      // those stale requests.  The content script clears seenM3u8 via
+      // clearEpisodeState once the new episode's player is ready.
+      console.log(`[AC] ADVANCE ep ${prevEp} -> ${autoCapture.currentEp} (epoch ${autoCapture.epoch})`);
       updateBadge();
       sendResponse({
         hasNext: true,
@@ -485,8 +519,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
   } else if (msg.type === "clearEpisodeState") {
     // Clear seen m3u8s between episodes so the next capture is detected fresh
+    console.log(`[AC] clearEpisodeState (ep ${autoCapture.currentEp}, epoch ${autoCapture.epoch}, had ${seenM3u8.size} seen urls)`);
     seenM3u8.clear();
     subtitlesSent.clear();
+    autoCapture.episodeDoneSent = false;  // allow retry to receive a fresh done-signal
     sendResponse({ ok: true });
   } else if (msg.type === "setEpisodeContext") {
     // Content script reports which episode is playing (for DOM-based sites like brocoflix)

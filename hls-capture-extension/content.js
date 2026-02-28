@@ -200,6 +200,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function sendMessageAsync(msg) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(msg, resolve);
+  });
+}
+
 function waitForEpisodeDone(timeoutMs) {
   return new Promise((resolve) => {
     autoCaptureResolveEpisode = resolve;
@@ -366,7 +372,8 @@ async function runAutoCaptureClickCard(state) {
     card.scrollIntoView({ block: "nearest", behavior: "instant" });
     await sleep(200);
     card.click();
-    await sleep(600);
+    console.log(`[AC] EP ${currentEp}: card clicked`);
+    await sleep(800);
     if (autoCaptureAborted) return;
 
     // Click the preferred server button (always visible, 1-indexed).
@@ -375,37 +382,53 @@ async function runAutoCaptureClickCard(state) {
     const serverBtn = allServerBtns[serverNum - 1];
     if (serverBtn && !serverBtn.classList.contains("active")) {
       serverBtn.click();
-      await sleep(600); // wait for iframe src to update to the selected server
+      console.log(`[AC] EP ${currentEp}: server button ${serverNum} clicked`);
+      await sleep(800); // wait for iframe src to update to the selected server
       if (autoCaptureAborted) return;
     }
+
+    // Clear seen state NOW — the old player has had time to settle, so any stale
+    // m3u8 requests were blocked by the still-populated seenM3u8 set.  Clearing
+    // here ensures the NEW episode's m3u8 (which fires after triggerIframeAutoPlay)
+    // passes the seenM3u8 check.  This is awaited to guarantee the clear is
+    // processed before any new m3u8 requests fire.
+    await sendMessageAsync({ type: "clearEpisodeState" });
+    console.log(`[AC] EP ${currentEp}: state cleared, triggering autoplay`);
 
     // Trigger playback by directly setting autoPlay=true on the iframe src.
     // Programmatic .click() on .episode-play-button is blocked by isTrusted checks;
     // iframe src manipulation bypasses this entirely.
-    triggerIframeAutoPlay();
+    const autoplayResult = triggerIframeAutoPlay();
+    console.log(`[AC] EP ${currentEp}: triggerIframeAutoPlay returned ${autoplayResult}`);
   } else {
+    console.log(`[AC] EP ${currentEp}: card NOT FOUND (${document.querySelectorAll(".episode-card").length} cards visible)`);
     showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} – card not found (${document.querySelectorAll(".episode-card").length} cards visible)`);
   }
 
   // Wait for m3u8 capture confirmation (max 15s)
+  console.log(`[AC] EP ${currentEp}: waiting for done-signal (15s timeout)`);
   let captured = await waitForEpisodeDone(15000);
   autoCaptureResolveEpisode = null;
+  console.log(`[AC] EP ${currentEp}: waitForEpisodeDone returned ${captured}`);
   if (autoCaptureAborted) return;
 
   // Retry once if not captured
   if (!captured && card) {
     showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (retrying...)`);
-    chrome.runtime.sendMessage({ type: "clearEpisodeState" });
+    console.log(`[AC] EP ${currentEp}: retrying...`);
+    await sendMessageAsync({ type: "clearEpisodeState" });
     card.click();
-    await sleep(600);
+    await sleep(800);
     triggerIframeAutoPlay();
     captured = await waitForEpisodeDone(15000);
     autoCaptureResolveEpisode = null;
+    console.log(`[AC] EP ${currentEp}: retry waitForEpisodeDone returned ${captured}`);
   }
 
   if (autoCaptureAborted) return;
 
   if (!captured) {
+    console.log(`[AC] EP ${currentEp}: SKIPPED (no m3u8 captured after 2 attempts)`);
     showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (skipped)`);
     await sleep(1000);
   }
@@ -438,6 +461,11 @@ async function runAutoCaptureHashReload(state) {
   autoCaptureAborted = false;
 
   showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp}`);
+
+  // Clear seen state for the new episode — the page has reloaded so old
+  // requests are gone, and we need seenM3u8 empty for the new m3u8.
+  await sendMessageAsync({ type: "clearEpisodeState" });
+  console.log(`[AC] EP ${currentEp}: state cleared (hash-reload)`);
 
   // Set up the done-listener BEFORE the sleep so we don't miss autoCaptureEpisodeDone
   // messages that arrive during page load (video can auto-play before we click play).
@@ -668,6 +696,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     removeAutoCaptureOverlay();
     sendResponse({ ok: true });
   } else if (msg.type === "autoCaptureEpisodeDone") {
+    console.log(`[AC] received autoCaptureEpisodeDone for ep ${msg.episode}, resolver=${autoCaptureResolveEpisode ? 'active' : 'null'}`);
     if (autoCaptureResolveEpisode) {
       autoCaptureResolveEpisode(true);
       autoCaptureResolveEpisode = null;

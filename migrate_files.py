@@ -6,8 +6,8 @@ Move/merge TV + Movie libraries from multiple "old" roots into new roots.
 
 TV behavior (drive-aware):
 1) If show exists in D:\TV Shows -> merge there
-2) Else if show exists in E:\TV Shows -> merge there
-3) Else -> create show in E:\TV Shows
+2) Else if show exists in F:\TV Shows -> merge there
+3) Else -> create show in L:\TV Shows
 
 Movies behavior:
 - Treats each immediate child folder of an OLD_MOVIE_DIR as a "movie folder"
@@ -38,9 +38,12 @@ OLD_MOVIE_DIRS = [
     r"C:\Temp_Media\Movies",
 ]
 
-# TV destinations
-PRIMARY_TV_DIR = r"F:\TV Shows"     # new / preferred
-SECONDARY_TV_DIR = r"D:\TV Shows"   # legacy (check first)
+# TV destinations (checked in order for existing shows; new shows go to NEW_TV_DIR)
+NEW_TV_DIR = r"L:\TV Shows"         # new shows land here
+EXISTING_TV_DIRS = [
+    r"D:\TV Shows",
+    r"F:\TV Shows",
+]
 
 # Movie destination
 NEW_MOVIE_DIR = r"F:\Movies"
@@ -148,24 +151,20 @@ def merge_dirs(src_dir: Path, dst_dir: Path, dry_run: bool, verbose: bool) -> No
 # TV-SPECIFIC LOGIC
 # =========================
 
-def choose_tv_destination(show_name: str, primary: Path, secondary: Path) -> Path:
-    secondary_candidate = secondary / show_name
-    if secondary_candidate.exists():
-        return secondary_candidate
+def choose_tv_destination(show_name: str, existing_dirs: list[Path], new_dir: Path) -> Path:
+    for d in existing_dirs:
+        candidate = d / show_name
+        if candidate.exists():
+            return candidate
 
-    primary_candidate = primary / show_name
-    if primary_candidate.exists():
-        return primary_candidate
-
-    return primary_candidate
+    return new_dir / show_name
 
 
 def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool) -> None:
-    primary = Path(PRIMARY_TV_DIR)
-    secondary = Path(SECONDARY_TV_DIR)
+    new_dir = Path(NEW_TV_DIR)
+    existing_dirs = [Path(d) for d in EXISTING_TV_DIRS]
 
-    ensure_dir(primary, dry_run, verbose)
-    ensure_dir(secondary, dry_run, verbose)
+    ensure_dir(new_dir, dry_run, verbose)
 
     planned = []
     for old in old_roots:
@@ -174,8 +173,8 @@ def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool) -> No
             planned.extend(iter_immediate_children_dirs(root))
 
     log("\n=== TV migration (drive-aware) ===")
-    log(f"  Primary TV:   {primary}")
-    log(f"  Secondary TV: {secondary}")
+    log(f"  New shows:    {new_dir}")
+    log(f"  Existing:     {', '.join(str(d) for d in existing_dirs)}")
     log(f"  Found {len(planned)} show folder(s)")
 
     processed = 0
@@ -191,7 +190,7 @@ def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool) -> No
             processed += 1
             show_name = show_dir.name
 
-            dst_dir = choose_tv_destination(show_name, primary, secondary)
+            dst_dir = choose_tv_destination(show_name, existing_dirs, new_dir)
 
             log(f"\n  ({processed}/{len(planned)}) {show_name}")
             log(f"    Target: {dst_dir}")
