@@ -60,6 +60,8 @@ def sanitize_for_windows(name: str) -> str:
     return name.rstrip(" .")
 
 
+_omdb_cache: Dict[str, Optional[Dict[str, str]]] = {}
+
 def try_omdb(params: dict) -> Optional[Dict[str, str]]:
     try:
         r = requests.get("https://www.omdbapi.com/", params=params, timeout=10)
@@ -75,18 +77,24 @@ def try_omdb(params: dict) -> Optional[Dict[str, str]]:
 
 
 def lookup_show(title_guess: str) -> Optional[Dict[str, str]]:
-    """Try OMDb exact title match, then search."""
+    """Try OMDb exact title match, then search.  Results are cached."""
     if not OMDB_API_KEY or not title_guess:
         return None
+
+    cache_key = title_guess.lower()
+    if cache_key in _omdb_cache:
+        return _omdb_cache[cache_key]
 
     # Exact title match
     meta = try_omdb({"apikey": OMDB_API_KEY, "t": title_guess, "type": "series"})
     if meta:
+        _omdb_cache[cache_key] = meta
         return meta
 
     # Search fallback
     meta = try_omdb({"apikey": OMDB_API_KEY, "s": title_guess, "type": "series"})
     if meta:
+        _omdb_cache[cache_key] = meta
         return meta
 
     # If title ends with digits (site slug artifact, e.g. "Paradise4" -> "Paradise"),
@@ -95,9 +103,11 @@ def lookup_show(title_guess: str) -> Optional[Dict[str, str]]:
     if stripped and stripped != title_guess:
         meta = try_omdb({"apikey": OMDB_API_KEY, "t": stripped, "type": "series"})
         if meta:
+            _omdb_cache[cache_key] = meta
             return meta
         meta = try_omdb({"apikey": OMDB_API_KEY, "s": stripped, "type": "series"})
         if meta:
+            _omdb_cache[cache_key] = meta
             return meta
 
     return None
@@ -227,7 +237,6 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
         m3u8_url,
     ]
 
-    print(f"  Running: yt-dlp -> {temp_file}", flush=True)
     update_download(ep_key, status="downloading")
 
     proc = subprocess.Popen(
@@ -242,14 +251,13 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
         m = _QUALITY_RE.search(line)
         if m:
             update_download(ep_key, quality=m.group("quality"))
-            print(f"  Quality: {m.group('quality')}", flush=True)
 
         # Parse total fragments
         m = _FRAGS_RE.search(line)
         if m:
             update_download(ep_key, total_frags=int(m.group("total")))
 
-        # Parse progress
+        # Parse progress (updates popup UI, no console output)
         m = _PROGRESS_RE.search(line)
         if m:
             update_download(
@@ -261,12 +269,6 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
                 frag=int(m.group("frag")),
                 total_frags=int(m.group("total")),
             )
-            # Print a summary line every 50 fragments
-            frag = int(m.group("frag"))
-            total = int(m.group("total"))
-            if frag % 50 == 0 or frag == total:
-                print(f"  [{m.group('pct')}%] frag {frag}/{total}  "
-                      f"{m.group('speed')}  ETA {m.group('eta')}  ~{m.group('size')}", flush=True)
 
         # Check for 100% done
         if _DONE_RE.search(line):
@@ -282,18 +284,15 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
     update_download(ep_key, status="moving")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(temp_file), str(output_path))
-    print(f"  Moved to: {output_path}", flush=True)
 
     # Move any .srt files that match the video name (skip thumbnail sprites)
     for sub_file in TEMP_DIR.glob(f"{temp_file.stem}*.srt"):
         content = sub_file.read_text(encoding="utf-8", errors="ignore")
         if "xywh=" in content or "thumbnails" in content.lower():
             sub_file.unlink()
-            print(f"  Deleted thumbnail sprite: {sub_file.name}", flush=True)
             continue
         sub_dest = output_path.parent / sub_file.name
         shutil.move(str(sub_file), str(sub_dest))
-        print(f"  Moved sub: {sub_file.name}", flush=True)
 
     update_download(ep_key, status="done", percent=100.0)
     return "downloaded"
@@ -496,7 +495,6 @@ def download_subtitle(subtitle_url: str, ep_key: str):
         # Video hasn't been processed yet, queue for later
         with _pending_subs_lock:
             _pending_subs.setdefault(ep_key, []).append(subtitle_url)
-        print(f"  Subtitle queued (waiting for video): {subtitle_url[:80]}...", flush=True)
         return
 
     show_title, season, episode = episode_info
@@ -507,7 +505,6 @@ def download_subtitle(subtitle_url: str, ep_key: str):
     # Check if subtitle already saved (file on disk or claimed by another thread)
     with _saved_subs_lock:
         if ep_key in _saved_subs or srt_path.exists():
-            print(f"  Subtitle skipped (already exists): {srt_path.name}", flush=True)
             return
 
     try:
@@ -522,17 +519,13 @@ def download_subtitle(subtitle_url: str, ep_key: str):
         # Check if English before saving
         accepted, reason = is_english_subtitle(content)
         if not accepted:
-            print(f"  Subtitle rejected ({reason}): {subtitle_url[:80]}...", flush=True)
             return
 
         # Claim this episode under lock so only the first English subtitle wins
         with _saved_subs_lock:
             if ep_key in _saved_subs:
-                print(f"  Subtitle skipped (already saved by another thread): {srt_path.name}", flush=True)
                 return
             _saved_subs.add(ep_key)
-
-        print(f"  Found English subtitle: {subtitle_url[:80]}...", flush=True)
 
         # Convert VTT to SRT if needed
         if subtitle_url.lower().endswith(".vtt") or content.strip().startswith("WEBVTT"):
@@ -540,9 +533,9 @@ def download_subtitle(subtitle_url: str, ep_key: str):
 
         srt_path.parent.mkdir(parents=True, exist_ok=True)
         srt_path.write_text(content, encoding="utf-8")
-        print(f"  Saved subtitle: {srt_path}", flush=True)
+        print(f"  [{ep_tag}] Subtitle saved — {srt_path.name}", flush=True)
     except Exception as e:
-        print(f"  Subtitle download failed: {e}", flush=True)
+        print(f"  [{ep_tag}] Subtitle failed: {e}", flush=True)
 
 
 def process_pending_subs(ep_key: str):
@@ -558,6 +551,14 @@ def process_pending_subs(ep_key: str):
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """Suppress noisy connection-abort errors from polling clients."""
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            return  # browser closed the connection before we finished — harmless
+        super().handle_error(request, client_address)
 
 
 def probe_formats(m3u8_url: str) -> list:
@@ -621,8 +622,11 @@ class HLSHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         msg = format % args
-        # Suppress noisy poll logs
-        if "GET /status" in msg or "GET /downloads" in msg:
+        # Suppress noisy/redundant HTTP request logs
+        if any(s in msg for s in ("GET /status", "GET /downloads",
+                                   "POST /capture", "POST /subtitle",
+                                   "POST /preview", "POST /season-info",
+                                   "OPTIONS")):
             return
         print(f"  [{self.client_address[0]}] {msg}", flush=True)
 
@@ -673,7 +677,6 @@ class HLSHandler(BaseHTTPRequestHandler):
             return
 
         ep_key = f"{info['show_slug']}|{info['season']}|{info['episode']}"
-        print(f"  Subtitle URL captured: {subtitle_url[:80]}... [{ep_key}]", flush=True)
 
         self._send_json({"status": "ok"})
 
@@ -723,8 +726,6 @@ class HLSHandler(BaseHTTPRequestHandler):
         formats = probe_formats(m3u8_url)
         best_quality = get_best_format_label(formats)
 
-        print(f"  Preview: {filename} [{best_quality}]", flush=True)
-
         self._send_json({
             "status": "ok",
             "show_title": show_title,
@@ -736,12 +737,45 @@ class HLSHandler(BaseHTTPRequestHandler):
             "formats": formats,
         })
 
+    def _handle_season_info(self):
+        """Log discovered episode list at the start of each season in auto-capture."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send_json({"status": "error", "message": str(e)}, 400)
+            return
+
+        show_name = body.get("show_name", "Unknown")
+        season = body.get("season")
+        episodes = body.get("episodes", [])
+
+        if season is not None and episodes:
+            # Build compact episode summary
+            ep_nums = []
+            for ep in episodes:
+                start = ep.get("epStart")
+                end = ep.get("epEnd")
+                if start is not None and end is not None and end > start:
+                    ep_nums.append(f"{start}-{end}")
+                elif start is not None:
+                    ep_nums.append(str(start))
+            ep_list = ", ".join(ep_nums)
+            print(f"\n  [AUTO-CAPTURE] Season S{season:02d} — {show_name}", flush=True)
+            print(f"  [AUTO-CAPTURE] {len(episodes)} episodes to capture: [{ep_list}]", flush=True)
+            print(flush=True)
+
+        self._send_json({"status": "ok"})
+
     def do_POST(self):
         if self.path == "/subtitle":
             self._handle_subtitle()
             return
         if self.path == "/preview":
             self._handle_preview()
+            return
+        if self.path == "/season-info":
+            self._handle_season_info()
             return
         if self.path != "/capture":
             self._send_json({"error": "not found"}, 404)
@@ -761,17 +795,12 @@ class HLSHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "error", "message": "missing m3u8_url"}, 400)
             return
 
-        print(f"\n{'='*60}", flush=True)
-        print(f"  Captured m3u8: {m3u8_url[:100]}...", flush=True)
-        print(f"  Page URL:      {page_url}", flush=True)
-
         # Parse show info from body fields or page URL
         info = parse_episode_info(body, page_url)
-        print(f"  Parsed:        {info}", flush=True)
 
         if not info["show_name"] or info["season"] is None or info["episode"] is None:
             msg = "Could not parse show/season/episode from page URL"
-            print(f"  ERROR: {msg}", flush=True)
+            print(f"  ERROR: {msg} — {page_url}", flush=True)
             self._send_json({"status": "error", "message": msg})
             return
 
@@ -779,7 +808,6 @@ class HLSHandler(BaseHTTPRequestHandler):
         ep_key = f"{info['show_slug']}|{info['season']}|{info['episode']}"
         with HLSHandler._lock:
             if ep_key in HLSHandler.seen_urls:
-                print(f"  Skipping duplicate episode: {ep_key}", flush=True)
                 self._send_json({"status": "skipped", "message": "duplicate episode"})
                 return
             HLSHandler.seen_urls.add(ep_key)
@@ -788,10 +816,8 @@ class HLSHandler(BaseHTTPRequestHandler):
         meta = lookup_show(info["show_name"])
         if meta:
             show_title = sanitize_for_windows(f"{meta['title']} ({meta['year']})")
-            print(f"  OMDb match:    {show_title}", flush=True)
         else:
             show_title = sanitize_for_windows(info["show_name"])
-            print(f"  OMDb miss, using: {show_title}", flush=True)
 
         season = info["season"]
         episode = info["episode"]
@@ -799,7 +825,8 @@ class HLSHandler(BaseHTTPRequestHandler):
         filename = f"{show_title} {ep_tag}.mp4"
         output_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / filename
 
-        print(f"  Output:        {output_path}", flush=True)
+        omdb_note = "" if meta else " (OMDb miss)"
+        print(f"  [{ep_tag}] Starting — {show_title}{omdb_note}", flush=True)
 
         # Register resolved episode so subtitles know where to save
         with _resolved_lock:
@@ -833,7 +860,10 @@ class HLSHandler(BaseHTTPRequestHandler):
 
         def do_download():
             result = download_m3u8(m3u8_url, output_path, self.dry_run, ep_key)
-            print(f"  Result:        {result}", flush=True)
+            if result == "downloaded":
+                print(f"  [{ep_tag}] Done — {output_path}", flush=True)
+            else:
+                print(f"  [{ep_tag}] {result}", flush=True)
 
         thread = threading.Thread(target=do_download, daemon=True)
         thread.start()

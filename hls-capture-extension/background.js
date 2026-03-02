@@ -1,6 +1,7 @@
 const SERVER_URL = "http://localhost:9876/capture";
 const PREVIEW_URL = "http://localhost:9876/preview";
 const SUBTITLE_URL = "http://localhost:9876/subtitle";
+const SEASON_INFO_URL = "http://localhost:9876/season-info";
 
 // ========= SITE CONFIGS =========
 
@@ -67,6 +68,13 @@ let autoCapture = {
   graceUntil: 0,  // timestamp: auto-confirm still fires during grace period after last ep
   epoch: 0,              // increments each episode advance; used to detect stale done-signals
   episodeDoneSent: false, // true after first done-signal for current epoch (prevents duplicates)
+  // Multi-season fields
+  multiSeason: false,
+  startSeason: null,
+  endSeason: null,
+  currentSeason: null,
+  // DOM-based episode discovery (hash-reload sites)
+  episodeHashes: [],     // discovered episode list for current season [{hash, epStart, epEnd}]
 };
 
 // ========= NETWORK INTERCEPTION =========
@@ -112,6 +120,40 @@ chrome.webRequest.onBeforeRequest.addListener(
       // video was slow to start and the content script timed out before the m3u8 fired.
       if (tabId === autoCapture.tabId &&
           (autoCapture.active || Date.now() < autoCapture.graceUntil)) {
+        // Verify page URL hash matches expected episode.
+        // 1movies.bz redirects non-existent episodes to #ep=1,1 — without
+        // this check the wrong content gets auto-confirmed and the skip
+        // counter never triggers, causing an infinite loop on S01E01.
+        if (autoCapture.episodeHashes.length > 0) {
+          // Discovery mode: currentEp is a 1-based index into episodeHashes,
+          // so validate by comparing the page hash against the discovered hash.
+          const epIdx = autoCapture.currentEp - 1;
+          const expectedHash = epIdx >= 0 && epIdx < autoCapture.episodeHashes.length
+            ? autoCapture.episodeHashes[epIdx].hash
+            : null;
+          if (expectedHash) {
+            const pageHashMatch = pageUrl.match(/#ep=\d+,\d+(?:-\d+)?/);
+            if (pageHashMatch && pageHashMatch[0] !== expectedHash) {
+              console.log(`[AC] m3u8 REJECTED: page hash ${pageHashMatch[0]} doesn't match expected ${expectedHash}`);
+              return;
+            }
+          }
+        } else {
+          // Fallback (no discovery): currentEp IS the actual episode number,
+          // so compare numerically.  Combined episodes use #ep=season,start-end.
+          const hashMatch = pageUrl.match(/#ep=(\d+),(\d+)(?:-(\d+))?/);
+          if (hashMatch) {
+            const actualSeason = parseInt(hashMatch[1], 10);
+            const actualEpStart = parseInt(hashMatch[2], 10);
+            const actualEpEnd = hashMatch[3] ? parseInt(hashMatch[3], 10) : actualEpStart;
+            const expectedSeason = autoCapture.multiSeason ? autoCapture.currentSeason : autoCapture.season;
+            const expectedEp = autoCapture.currentEp;
+            if (actualSeason !== expectedSeason || expectedEp < actualEpStart || expectedEp > actualEpEnd) {
+              console.log(`[AC] m3u8 REJECTED: page hash S${actualSeason}E${actualEpStart}${hashMatch[3] ? "-" + actualEpEnd : ""} doesn't cover expected S${expectedSeason}E${expectedEp}`);
+              return;
+            }
+          }
+        }
         console.log(`[AC] m3u8 intercepted for ep ${autoCapture.currentEp} (epoch ${autoCapture.epoch}): ${url.slice(0, 80)}`);
         autoConfirmCapture(url, pageUrl, tabId);
         return;
@@ -284,9 +326,12 @@ async function sendSubtitle(subtitleUrl, pageUrl, tabId) {
 // ========= BADGE =========
 
 function updateBadge() {
-  // Auto-capture mode: show progress like "3/15"
+  // Auto-capture mode: show progress
   if (autoCapture.active) {
-    chrome.action.setBadgeText({ text: `${autoCapture.doneCount}/${autoCapture.totalCount}` });
+    const text = autoCapture.totalCount > 0
+      ? `${autoCapture.doneCount}/${autoCapture.totalCount}`
+      : `${autoCapture.doneCount}`;
+    chrome.action.setBadgeText({ text });
     chrome.action.setBadgeBackgroundColor({ color: "#4338ca" });
     return;
   }
@@ -359,29 +404,63 @@ async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
   console.log(`[AC] autoConfirmCapture DONE-SIGNAL ep=${ep} epoch=${epoch}`);
   notifyTab(tabId, {
     type: "autoCaptureEpisodeDone",
-    season: autoCapture.season,
+    season: autoCapture.multiSeason ? autoCapture.currentSeason : autoCapture.season,
     episode: autoCapture.currentEp,
   });
 }
 
-function startAutoCapture(season, startEp, endEp, tabId, tabUrl, serverNum) {
+function startAutoCapture(params, tabId, tabUrl) {
   const siteConfig = getSiteConfig(tabUrl);
+  const serverNum = params.serverNum || 1;
 
-  autoCapture = {
-    active: true,
-    finished: false,
-    tabId,
-    season,
-    startEp,
-    endEp,
-    currentEp: startEp,
-    doneCount: 0,
-    totalCount: endEp - startEp + 1,
-    siteConfig,
-    serverNum: serverNum || 1,
-    epoch: 0,
-    episodeDoneSent: false,
-  };
+  if (params.multiSeason) {
+    // Multi-season mode: start at first season, ep 1, endEp unknown (detected per season)
+    autoCapture = {
+      active: true,
+      finished: false,
+      tabId,
+      season: params.startSeason,
+      startEp: 1,
+      endEp: null,       // set per-season by autoCaptureEpisodesDiscovered or autoCaptureSeasonDetected
+      currentEp: 1,
+      doneCount: 0,
+      totalCount: 0,     // accumulated as seasons are detected/discovered
+      siteConfig,
+      serverNum,
+      epoch: 0,
+      episodeDoneSent: false,
+      graceUntil: 0,
+      multiSeason: true,
+      startSeason: params.startSeason,
+      endSeason: params.endSeason,
+      currentSeason: params.startSeason,
+      consecutiveSkips: 0,
+      episodeHashes: [],
+    };
+  } else {
+    // Single-season episode-range mode (existing behavior)
+    autoCapture = {
+      active: true,
+      finished: false,
+      tabId,
+      season: params.season,
+      startEp: params.startEp,
+      endEp: params.endEp,
+      currentEp: params.startEp,
+      doneCount: 0,
+      totalCount: params.endEp - params.startEp + 1,
+      siteConfig,
+      serverNum,
+      epoch: 0,
+      episodeDoneSent: false,
+      graceUntil: 0,
+      multiSeason: false,
+      startSeason: null,
+      endSeason: null,
+      currentSeason: null,
+      episodeHashes: [],
+    };
+  }
 
   // Clear seen state so first episode's m3u8 and subtitles are detected fresh
   seenM3u8.clear();
@@ -389,15 +468,31 @@ function startAutoCapture(season, startEp, endEp, tabId, tabUrl, serverNum) {
   pendingCaptures = [];
   updateBadge();
 
-  // Forward to content script — it will navigate to the first episode
-  notifyTab(tabId, {
-    type: "beginAutoCapture",
-    season,
-    startEp,
-    endEp,
-    siteConfig,
-    serverNum: autoCapture.serverNum,
-  });
+  // Navigate to the first episode
+  if (siteConfig?.navStrategy === "hash-reload") {
+    // For hash-reload sites, navigate directly via scripting API.
+    // This is more reliable than notifyTab because it doesn't depend on
+    // an existing content script (which may have a stale context after
+    // extension reload).  After reload, the fresh content script picks up
+    // auto-capture state via checkAutoCaptureOnLoad.
+    const hash = siteConfig.makeEpisodeHash(autoCapture.season, autoCapture.startEp);
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: (h) => { location.hash = h; location.reload(); },
+      args: [hash],
+    });
+  } else {
+    // SPA sites: content script handles navigation in-place
+    notifyTab(tabId, {
+      type: "beginAutoCapture",
+      season: autoCapture.season,
+      startEp: autoCapture.startEp,
+      endEp: autoCapture.endEp,
+      siteConfig,
+      serverNum,
+      multiSeason: autoCapture.multiSeason,
+    });
+  }
 }
 
 function stopAutoCapture() {
@@ -433,6 +528,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       startEp: null, endEp: null, currentEp: null, doneCount: 0,
       totalCount: 0, siteConfig: null, graceUntil: 0,
       epoch: 0, episodeDoneSent: false,
+      multiSeason: false, startSeason: null, endSeason: null, currentSeason: null,
+      consecutiveSkips: 0, episodeHashes: [],
     };
     updateBadge();
     sendResponse({ ok: true });
@@ -443,7 +540,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "No active tab" });
         return;
       }
-      startAutoCapture(msg.season, msg.startEp, msg.endEp, tab.id, tab.url, msg.serverNum);
+      startAutoCapture(msg, tab.id, tab.url);
       sendResponse({ ok: true });
     });
     return true; // async response
@@ -460,10 +557,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       currentEp: autoCapture.currentEp,
       doneCount: autoCapture.doneCount,
       totalCount: autoCapture.totalCount,
+      multiSeason: autoCapture.multiSeason,
+      startSeason: autoCapture.startSeason,
+      endSeason: autoCapture.endSeason,
+      currentSeason: autoCapture.currentSeason,
     });
   } else if (msg.type === "checkAutoCapture") {
     // Content script checks on page load if auto-capture is active for this tab
     if (autoCapture.active && sender.tab && sender.tab.id === autoCapture.tabId) {
+      // Provide the discovered hash for the current episode (if available)
+      const epIndex = autoCapture.currentEp - 1;
+      const currentHash = autoCapture.episodeHashes.length > 0 && epIndex >= 0 && epIndex < autoCapture.episodeHashes.length
+        ? autoCapture.episodeHashes[epIndex].hash
+        : null;
       sendResponse({
         active: true,
         season: autoCapture.season,
@@ -472,31 +578,131 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         endEp: autoCapture.endEp,
         siteConfig: autoCapture.siteConfig,
         serverNum: autoCapture.serverNum,
+        multiSeason: autoCapture.multiSeason,
+        currentSeason: autoCapture.currentSeason,
+        startSeason: autoCapture.startSeason,
+        endSeason: autoCapture.endSeason,
+        needsDiscovery: autoCapture.episodeHashes.length === 0,
+        hash: currentHash,
       });
     } else {
       sendResponse({ active: false });
     }
   } else if (msg.type === "autoCaptureAdvance") {
     // Content script finished an episode, advance to next or complete
-    if (autoCapture.active && autoCapture.currentEp < autoCapture.endEp) {
+    const skipped = msg.skipped === true;
+
+    // Multi-season with unknown episode count (hash-reload): use consecutive
+    // skip counter — require 2 consecutive skipped episodes before declaring
+    // a season done.  A single transient failure (slow page load, timing) won't
+    // prematurely end the capture.
+    if (skipped && autoCapture.active && autoCapture.multiSeason && autoCapture.endEp == null) {
+      autoCapture.consecutiveSkips = (autoCapture.consecutiveSkips || 0) + 1;
+      console.log(`[AC] SKIP S${autoCapture.currentSeason} EP${autoCapture.currentEp} (consecutive: ${autoCapture.consecutiveSkips})`);
+
+      if (autoCapture.consecutiveSkips >= 2) {
+        // 2 consecutive skips = season confirmed done
+        autoCapture.consecutiveSkips = 0;
+        if (autoCapture.currentSeason < autoCapture.endSeason) {
+          // Advance to next season
+          const prevSeason = autoCapture.currentSeason;
+          autoCapture.currentSeason++;
+          autoCapture.season = autoCapture.currentSeason;
+          autoCapture.currentEp = 1;
+          autoCapture.startEp = 1;
+          autoCapture.endEp = null;
+          autoCapture.episodeHashes = [];  // clear so content script re-discovers
+          autoCapture.epoch++;
+          autoCapture.episodeDoneSent = false;
+          console.log(`[AC] SKIP->ADVANCE SEASON S${prevSeason} -> S${autoCapture.currentSeason} (epoch ${autoCapture.epoch})`);
+          updateBadge();
+          sendResponse({
+            hasNext: true,
+            season: autoCapture.currentSeason,
+            nextEp: 1,
+            startEp: 1,
+            endEp: null,
+            siteConfig: autoCapture.siteConfig,
+            serverNum: autoCapture.serverNum,
+            multiSeason: true,
+            newSeason: true,
+          });
+        } else {
+          // Last season done
+          console.log(`[AC] SKIP on last season S${autoCapture.currentSeason} — finishing`);
+          autoCapture.active = false;
+          autoCapture.finished = true;
+          autoCapture.graceUntil = Date.now() + 15000;
+          updateBadge();
+          sendResponse({ hasNext: false });
+        }
+      } else {
+        // First skip — try next episode (might be a transient failure)
+        const prevEp = autoCapture.currentEp;
+        autoCapture.currentEp++;
+        autoCapture.epoch++;
+        autoCapture.episodeDoneSent = false;
+        console.log(`[AC] SKIP->TRY NEXT ep ${prevEp} -> ${autoCapture.currentEp} (epoch ${autoCapture.epoch})`);
+        updateBadge();
+        const skipNextIdx = autoCapture.currentEp - 1;
+        const skipNextHash = autoCapture.episodeHashes.length > skipNextIdx ? autoCapture.episodeHashes[skipNextIdx].hash : null;
+        sendResponse({
+          hasNext: true,
+          season: autoCapture.multiSeason ? autoCapture.currentSeason : autoCapture.season,
+          nextEp: autoCapture.currentEp,
+          startEp: autoCapture.startEp,
+          endEp: autoCapture.endEp,
+          siteConfig: autoCapture.siteConfig,
+          serverNum: autoCapture.serverNum,
+          multiSeason: autoCapture.multiSeason,
+          hash: skipNextHash,
+        });
+      }
+    } else if (autoCapture.active && (autoCapture.endEp == null || autoCapture.currentEp < autoCapture.endEp)) {
+      // Next episode in current season (endEp null = unknown count, keep going)
+      if (!skipped) autoCapture.consecutiveSkips = 0;  // reset on successful capture
       const prevEp = autoCapture.currentEp;
       autoCapture.currentEp++;
-      autoCapture.epoch++;              // new epoch so stale done-signals are ignored
+      autoCapture.epoch++;
       autoCapture.episodeDoneSent = false;
-      // DO NOT clear seenM3u8 here — stale m3u8 requests from the old episode's
-      // player teardown may still be in-flight.  Keeping them in seenM3u8 blocks
-      // those stale requests.  The content script clears seenM3u8 via
-      // clearEpisodeState once the new episode's player is ready.
       console.log(`[AC] ADVANCE ep ${prevEp} -> ${autoCapture.currentEp} (epoch ${autoCapture.epoch})`);
       updateBadge();
+      const advNextIdx = autoCapture.currentEp - 1;
+      const advNextHash = autoCapture.episodeHashes.length > advNextIdx ? autoCapture.episodeHashes[advNextIdx].hash : null;
       sendResponse({
         hasNext: true,
-        season: autoCapture.season,
+        season: autoCapture.multiSeason ? autoCapture.currentSeason : autoCapture.season,
         nextEp: autoCapture.currentEp,
         startEp: autoCapture.startEp,
         endEp: autoCapture.endEp,
         siteConfig: autoCapture.siteConfig,
         serverNum: autoCapture.serverNum,
+        multiSeason: autoCapture.multiSeason,
+        hash: advNextHash,
+      });
+    } else if (autoCapture.active && autoCapture.multiSeason && autoCapture.currentSeason < autoCapture.endSeason) {
+      // Multi-season: advance to next season (endEp reached)
+      const prevSeason = autoCapture.currentSeason;
+      autoCapture.currentSeason++;
+      autoCapture.season = autoCapture.currentSeason;
+      autoCapture.currentEp = 1;
+      autoCapture.startEp = 1;
+      autoCapture.endEp = null;  // will be set by autoCaptureEpisodesDiscovered or autoCaptureSeasonDetected
+      autoCapture.episodeHashes = [];  // clear so content script re-discovers
+      autoCapture.epoch++;
+      autoCapture.episodeDoneSent = false;
+      console.log(`[AC] ADVANCE SEASON S${prevSeason} -> S${autoCapture.currentSeason} (epoch ${autoCapture.epoch})`);
+      updateBadge();
+      sendResponse({
+        hasNext: true,
+        season: autoCapture.currentSeason,
+        nextEp: 1,
+        startEp: 1,
+        endEp: null,
+        siteConfig: autoCapture.siteConfig,
+        serverNum: autoCapture.serverNum,
+        multiSeason: true,
+        newSeason: true,
       });
     } else {
       autoCapture.active = false;
@@ -523,6 +729,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     seenM3u8.clear();
     subtitlesSent.clear();
     autoCapture.episodeDoneSent = false;  // allow retry to receive a fresh done-signal
+    sendResponse({ ok: true });
+  } else if (msg.type === "autoCaptureEpisodesDiscovered") {
+    // Content script discovered episode hashes from the DOM (hash-reload sites)
+    if (autoCapture.active && msg.episodes && msg.episodes.length > 0) {
+      autoCapture.episodeHashes = msg.episodes;
+      autoCapture.endEp = msg.episodes.length;
+      autoCapture.startEp = 1;
+      autoCapture.totalCount += msg.episodes.length;
+      const season = autoCapture.multiSeason ? autoCapture.currentSeason : autoCapture.season;
+      console.log(`[AC] Season S${season}: discovered ${msg.episodes.length} episodes`);
+      updateBadge();
+
+      // Notify the server so it can log the season episode list
+      fetch(SEASON_INFO_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          show_name: msg.showName || "",
+          season,
+          episodes: msg.episodes,
+        }),
+      }).catch(() => {}); // fire-and-forget
+    }
+    sendResponse({ ok: true });
+  } else if (msg.type === "autoCaptureSeasonDetected") {
+    // Content script reports episode count after selecting a season in the dropdown
+    if (autoCapture.active && autoCapture.multiSeason) {
+      autoCapture.endEp = msg.episodeCount;
+      autoCapture.startEp = 1;
+      autoCapture.totalCount += msg.episodeCount;
+      console.log(`[AC] Season S${autoCapture.currentSeason} detected: ${msg.episodeCount} episodes (total across seasons: ${autoCapture.totalCount})`);
+      updateBadge();
+    }
     sendResponse({ ok: true });
   } else if (msg.type === "setEpisodeContext") {
     // Content script reports which episode is playing (for DOM-based sites like brocoflix)

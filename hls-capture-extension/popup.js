@@ -186,12 +186,30 @@ const acIdle = document.getElementById("acIdle");
 const acRunning = document.getElementById("acRunning");
 const acIdleStatus = document.getElementById("acIdleStatus");
 const acRunStatus = document.getElementById("acRunStatus");
+const acModeTabs = document.getElementById("acModeTabs");
+const acSeasonEndWrap = document.getElementById("acSeasonEndWrap");
+const acSeasonEndInput = document.getElementById("acSeasonEndInput");
+const acEpWrap = document.getElementById("acEpWrap");
 
 const SUPPORTED_SITES = ["1movies.bz", "brocoflix.xyz"];
+
+// Mode: "episodes" (single season, ep range) or "seasons" (multi-season, auto-detect ep count)
+let acMode = "episodes";
+
+acModeTabs.addEventListener("click", (e) => {
+  const tab = e.target.closest(".ac-mode-tab");
+  if (!tab || tab.dataset.mode === acMode) return;
+  acMode = tab.dataset.mode;
+  acModeTabs.querySelectorAll(".ac-mode-tab").forEach(t => t.classList.remove("active"));
+  tab.classList.add("active");
+  acEpWrap.style.display = acMode === "episodes" ? "" : "none";
+  acSeasonEndWrap.style.display = acMode === "seasons" ? "" : "none";
+});
 
 // Prevent auto-fill from clobbering user-edited season input
 let acSeasonDirty = false;
 acSeasonInput.addEventListener("input", () => { acSeasonDirty = true; });
+acSeasonEndInput.addEventListener("input", () => { acSeasonDirty = true; });
 
 function getSiteFromUrl(url) {
   if (!url) return null;
@@ -240,9 +258,16 @@ function updateAutoCaptureUI() {
       acIdle.style.display = "none";
       acRunning.style.display = "";
       const current = state.currentEp || state.startEp;
-      acRunStatus.textContent = `EP ${current} of ${state.startEp}–${state.endEp}...`;
-      if (state.doneCount !== undefined) {
-        acRunStatus.textContent = `EP ${current} of ${state.startEp}–${state.endEp} (${state.doneCount} captured)`;
+      if (state.multiSeason) {
+        const seasonLabel = `S${state.currentSeason}`;
+        const epRange = state.endEp ? `EP ${current}/${state.endEp}` : `EP ${current}`;
+        const progress = state.totalCount > 0 ? `${state.doneCount}/${state.totalCount}` : `${state.doneCount}`;
+        acRunStatus.textContent = `${seasonLabel} ${epRange} (${progress} captured)`;
+      } else {
+        acRunStatus.textContent = `EP ${current} of ${state.startEp}–${state.endEp}...`;
+        if (state.doneCount !== undefined) {
+          acRunStatus.textContent = `EP ${current} of ${state.startEp}–${state.endEp} (${state.doneCount} captured)`;
+        }
       }
     } else if (state.finished) {
       acSection.classList.add("active");
@@ -260,42 +285,76 @@ function updateAutoCaptureUI() {
 
 acStartBtn.addEventListener("click", () => {
   const season = parseInt(acSeasonInput.value, 10);
-  const startEp = parseInt(acFromEp.value, 10);
-  const endEp = parseInt(acToEp.value, 10);
 
   if (!season || season < 1) {
     acIdleStatus.textContent = "Enter a season number";
     acIdleStatus.className = "ac-status error";
     return;
   }
-  if (!startEp || !endEp || startEp > endEp || startEp < 1) {
-    acIdleStatus.textContent = "Invalid episode range";
-    acIdleStatus.className = "ac-status error";
-    return;
-  }
-
-  acStartBtn.disabled = true;
-  acIdleStatus.textContent = "Starting...";
 
   const serverNum = parseInt(acServerInput.value, 10) || 1;
 
-  chrome.runtime.sendMessage({
-    type: "startAutoCapture",
-    season,
-    startEp,
-    endEp,
-    serverNum,
-  }, (resp) => {
-    acStartBtn.disabled = false;
-    if (resp && resp.ok) {
-      acIdle.style.display = "none";
-      acRunning.style.display = "";
-      acRunStatus.textContent = `Capturing EP ${startEp} of ${startEp}–${endEp}...`;
-    } else {
-      acIdleStatus.textContent = resp?.error || "Failed to start";
+  if (acMode === "seasons") {
+    // Multi-season mode
+    const endSeason = parseInt(acSeasonEndInput.value, 10);
+    if (!endSeason || season > endSeason) {
+      acIdleStatus.textContent = "Invalid season range";
       acIdleStatus.className = "ac-status error";
+      return;
     }
-  });
+
+    acStartBtn.disabled = true;
+    acIdleStatus.textContent = "Starting...";
+
+    chrome.runtime.sendMessage({
+      type: "startAutoCapture",
+      multiSeason: true,
+      startSeason: season,
+      endSeason,
+      serverNum,
+    }, (resp) => {
+      acStartBtn.disabled = false;
+      if (resp && resp.ok) {
+        acIdle.style.display = "none";
+        acRunning.style.display = "";
+        acRunStatus.textContent = `Capturing S${season}–S${endSeason}...`;
+      } else {
+        acIdleStatus.textContent = resp?.error || "Failed to start";
+        acIdleStatus.className = "ac-status error";
+      }
+    });
+  } else {
+    // Episode range mode (existing behavior)
+    const startEp = parseInt(acFromEp.value, 10);
+    const endEp = parseInt(acToEp.value, 10);
+
+    if (!startEp || !endEp || startEp > endEp || startEp < 1) {
+      acIdleStatus.textContent = "Invalid episode range";
+      acIdleStatus.className = "ac-status error";
+      return;
+    }
+
+    acStartBtn.disabled = true;
+    acIdleStatus.textContent = "Starting...";
+
+    chrome.runtime.sendMessage({
+      type: "startAutoCapture",
+      season,
+      startEp,
+      endEp,
+      serverNum,
+    }, (resp) => {
+      acStartBtn.disabled = false;
+      if (resp && resp.ok) {
+        acIdle.style.display = "none";
+        acRunning.style.display = "";
+        acRunStatus.textContent = `Capturing EP ${startEp} of ${startEp}–${endEp}...`;
+      } else {
+        acIdleStatus.textContent = resp?.error || "Failed to start";
+        acIdleStatus.className = "ac-status error";
+      }
+    });
+  }
 });
 
 // --- DOM Inspector ---

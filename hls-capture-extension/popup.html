@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
+<meta charset="utf-8">
   <style>
     body {
       width: 420px;
@@ -314,6 +315,29 @@
     .ac-status.running { color: #6ee7b7; }
     .ac-status.done { color: #a78bfa; }
     .ac-status.error { color: #fca5a5; }
+    .ac-mode-tabs {
+      display: flex;
+      background: #0f172a;
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+      margin-bottom: 10px;
+    }
+    .ac-mode-tab {
+      flex: 1;
+      text-align: center;
+      padding: 5px 0;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      color: #6b7280;
+      background: transparent;
+      border: none;
+      transition: all 0.15s ease;
+    }
+    .ac-mode-tab:hover { color: #9ca3af; background: #1e293b; }
+    .ac-mode-tab.active { background: #4338ca; color: #e0e0ff; }
   </style>
 </head>
 <body>
@@ -324,17 +348,27 @@
   </div>
   <div id="autoCapture" class="auto-capture hidden">
     <div class="ac-header">
-      <span class="ac-title">Auto-Capture</span>
+      <span class="ac-title">AUTO-CAPTURE</span>
       <span id="acSite" class="ac-season"></span>
+    </div>
+    <div class="ac-mode-tabs" id="acModeTabs">
+      <button class="ac-mode-tab active" data-mode="episodes">Episodes</button>
+      <button class="ac-mode-tab" data-mode="seasons">Seasons</button>
     </div>
     <div id="acIdle">
       <div class="ac-inputs">
         <label>S</label>
         <input type="number" id="acSeasonInput" min="1" value="1">
-        <label>EP</label>
-        <input type="number" id="acFromEp" min="1" value="1">
-        <label>–</label>
-        <input type="number" id="acToEp" min="1" value="10">
+        <span id="acSeasonEndWrap" style="display:none;">
+          <label>–</label>
+          <input type="number" id="acSeasonEndInput" min="1" value="5">
+        </span>
+        <span id="acEpWrap">
+          <label>EP</label>
+          <input type="number" id="acFromEp" min="1" value="1">
+          <label>–</label>
+          <input type="number" id="acToEp" min="1" value="10">
+        </span>
         <label>Srv</label>
         <input type="number" id="acServerInput" min="1" max="9" value="1" title="Server number (1=default)">
       </div>

@@ -330,10 +330,16 @@ function setupBrocoflixListeners() {
 // Navigate between episodes by clicking .episode-card elements in the DOM.
 // No page reload needed — the site is a SPA and updates the player in-place.
 async function runAutoCaptureClickCard(state) {
-  const { season, currentEp, startEp, endEp } = state;
+  const { season, currentEp, startEp, endEp, multiSeason } = state;
   autoCaptureAborted = false;
 
-  showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp}`);
+  if (multiSeason && endEp) {
+    showAutoCaptureOverlay(`Auto-capture: S${season} EP ${currentEp}/${endEp}`);
+  } else if (multiSeason) {
+    showAutoCaptureOverlay(`Auto-capture: S${season} EP ${currentEp} (detecting...)`);
+  } else {
+    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp}`);
+  }
 
   // Ensure the correct season is selected in the dropdown
   const seasonSelect = document.querySelector("#season-select");
@@ -348,6 +354,21 @@ async function runAutoCaptureClickCard(state) {
   await waitForElement(".episode-play-button", 8000);
   if (autoCaptureAborted) return;
 
+  // Multi-season: on the first episode of each season, count episode cards and report to background
+  if (multiSeason && currentEp === 1) {
+    let epCount = document.querySelectorAll(`.episode-card[data-season="${season}"]`).length;
+    if (epCount === 0) {
+      epCount = document.querySelectorAll(".episode-card").length;
+    }
+    console.log(`[AC] Season S${season}: detected ${epCount} episodes`);
+    await sendMessageAsync({ type: "autoCaptureSeasonDetected", episodeCount: epCount });
+    // Update the overlay now that we know the count
+    showAutoCaptureOverlay(`Auto-capture: S${season} EP ${currentEp}/${epCount}`);
+    // Update local state so subsequent overlay updates use the correct endEp
+    state.endEp = epCount;
+    if (autoCaptureAborted) return;
+  }
+
   // Find the episode card for the target episode.
   // Primary:  data-season + data-episode attributes on .episode-card
   // Fallback: Nth .episode-card (1-indexed, assuming the list is in episode order)
@@ -357,7 +378,10 @@ async function runAutoCaptureClickCard(state) {
   if (!card) {
     const allCards = document.querySelectorAll(".episode-card");
     card = allCards[currentEp - 1] || null;
-    if (card) showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (index fallback)`);
+    if (card) {
+      const label = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp} of ${startEp}–${endEp}`;
+      showAutoCaptureOverlay(`Auto-capture: ${label} (index fallback)`);
+    }
   }
 
   if (card) {
@@ -402,7 +426,8 @@ async function runAutoCaptureClickCard(state) {
     console.log(`[AC] EP ${currentEp}: triggerIframeAutoPlay returned ${autoplayResult}`);
   } else {
     console.log(`[AC] EP ${currentEp}: card NOT FOUND (${document.querySelectorAll(".episode-card").length} cards visible)`);
-    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} – card not found (${document.querySelectorAll(".episode-card").length} cards visible)`);
+    const notFoundLabel = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp}`;
+    showAutoCaptureOverlay(`Auto-capture: ${notFoundLabel} – card not found (${document.querySelectorAll(".episode-card").length} cards visible)`);
   }
 
   // Wait for m3u8 capture confirmation (max 15s)
@@ -414,7 +439,8 @@ async function runAutoCaptureClickCard(state) {
 
   // Retry once if not captured
   if (!captured && card) {
-    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (retrying...)`);
+    const retryLabel = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp} of ${startEp}–${endEp}`;
+    showAutoCaptureOverlay(`Auto-capture: ${retryLabel} (retrying...)`);
     console.log(`[AC] EP ${currentEp}: retrying...`);
     await sendMessageAsync({ type: "clearEpisodeState" });
     card.click();
@@ -428,13 +454,14 @@ async function runAutoCaptureClickCard(state) {
   if (autoCaptureAborted) return;
 
   if (!captured) {
+    const skipLabel = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp} of ${startEp}–${endEp}`;
     console.log(`[AC] EP ${currentEp}: SKIPPED (no m3u8 captured after 2 attempts)`);
-    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (skipped)`);
+    showAutoCaptureOverlay(`Auto-capture: ${skipLabel} (skipped)`);
     await sleep(1000);
   }
 
   // Ask background to advance; on success, click the next card directly (no reload)
-  chrome.runtime.sendMessage({ type: "autoCaptureAdvance" }, (resp) => {
+  chrome.runtime.sendMessage({ type: "autoCaptureAdvance", skipped: !captured }, (resp) => {
     if (chrome.runtime.lastError || !resp) return;
 
     if (resp.hasNext) {
@@ -444,6 +471,7 @@ async function runAutoCaptureClickCard(state) {
         startEp: resp.startEp,
         endEp: resp.endEp,
         serverNum: resp.serverNum,
+        multiSeason: resp.multiSeason,
       });
     } else {
       showAutoCaptureOverlay("Auto-capture complete!");
@@ -452,15 +480,146 @@ async function runAutoCaptureClickCard(state) {
   });
 }
 
+// ========= DOM-BASED EPISODE DISCOVERY (1movies.bz) =========
+
+// Scan the page DOM for episode links matching #ep=season,...
+// Returns an ordered array of { hash, epStart, epEnd } objects.
+function discoverEpisodeHashes(season) {
+  const links = document.querySelectorAll('a[href*="#ep="]');
+  const seen = new Set();
+  const episodes = [];
+
+  for (const link of links) {
+    const href = link.getAttribute("href");
+    const m = href && href.match(/#ep=(\d+),(\d+)(?:-(\d+))?/);
+    if (!m) continue;
+    const linkSeason = parseInt(m[1], 10);
+    if (linkSeason !== season) continue;
+
+    const hash = m[0]; // e.g. "#ep=10,8-9"
+    if (seen.has(hash)) continue;
+    seen.add(hash);
+
+    const epStart = parseInt(m[2], 10);
+    const epEnd = m[3] ? parseInt(m[3], 10) : epStart;
+    episodes.push({ hash, epStart, epEnd });
+  }
+
+  // Sort by episode start number
+  episodes.sort((a, b) => a.epStart - b.epStart);
+  return episodes;
+}
+
 // ========= AUTO-CAPTURE: HASH-RELOAD STRATEGY (1movies.bz) =========
 
 // Navigate between episodes by changing location.hash and reloading the page.
 // Required for sites that only load subtitle VTT files on a full page init.
 async function runAutoCaptureHashReload(state) {
-  const { season, currentEp, endEp, startEp } = state;
+  const { season, currentEp, endEp, startEp, multiSeason } = state;
   autoCaptureAborted = false;
 
-  showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp}`);
+  // Episode discovery: on first episode of a season (or when background says
+  // discovery hasn't happened yet), scan the DOM for episode links and report
+  // the list to background.  This gives us exact episode counts and correct
+  // hashes for combined episodes (e.g. #ep=10,8-9).
+  //
+  // Sites like 1movies.bz load episode links via JavaScript AFTER the initial
+  // HTML is ready.  At document_idle, only a partial list may be present.
+  // We poll until the link count stabilizes to ensure we capture the full list.
+  if (state.needsDiscovery) {
+    showAutoCaptureOverlay(`Auto-capture: S${season} (discovering episodes...)`);
+
+    let discovered = [];
+    let lastCount = 0;
+    let stableMs = 0;
+    const pollMs = 500;
+    const maxWaitMs = 6000;
+    const stableThresholdMs = 1500;
+    let elapsed = 0;
+
+    while (elapsed < maxWaitMs) {
+      discovered = discoverEpisodeHashes(season);
+      if (discovered.length > 0 && discovered.length === lastCount) {
+        stableMs += pollMs;
+        if (stableMs >= stableThresholdMs) break;
+      } else {
+        lastCount = discovered.length;
+        stableMs = 0;
+        // Bail early if still 0 links after half the timeout
+        if (discovered.length === 0 && elapsed >= maxWaitMs / 2) break;
+      }
+      await sleep(pollMs);
+      elapsed += pollMs;
+      if (autoCaptureAborted) return;
+    }
+
+    console.log(`[AC] S${season}: discoverEpisodeHashes found ${discovered.length} entries (waited ${elapsed}ms)`);
+    if (discovered.length > 0) {
+      await sendMessageAsync({
+        type: "autoCaptureEpisodesDiscovered",
+        episodes: discovered,
+        showName: getShowTitleFromDom(),
+      });
+      // Update local state with the discovery results
+      state.endEp = discovered.length;
+      state.needsDiscovery = false;
+    } else {
+      console.log(`[AC] S${season}: discovery found no links — falling back to constructed hashes`);
+    }
+  }
+
+  // If we have a discovered hash for this episode, ensure location.hash matches it.
+  // This handles combined episodes (e.g. #ep=10,8-9) that would be missed by
+  // the simple constructed hash (#ep=10,8).
+  if (state.hash && location.hash !== state.hash) {
+    console.log(`[AC] EP ${currentEp}: re-navigating to discovered hash ${state.hash} (was ${location.hash})`);
+    location.hash = state.hash;
+    location.reload();
+    return;
+  }
+
+  // Early redirect detection (safety net — fallback mode only).
+  // When discovery is active (state.hash is set), we navigated to the exact
+  // discovered hash, so the redirect check is unnecessary.  More importantly,
+  // currentEp is the 1-based INDEX into the discovered list, which doesn't
+  // match actual episode numbers after combined episodes (e.g. #ep=10,8-9).
+  // Only run this check when we don't have a discovered hash.
+  if (!state.hash) {
+    const hashMatch = location.hash.match(/#ep=(\d+),(\d+)(?:-(\d+))?/);
+    if (hashMatch) {
+      const actualSeason = parseInt(hashMatch[1], 10);
+      const actualEpStart = parseInt(hashMatch[2], 10);
+      const actualEpEnd = hashMatch[3] ? parseInt(hashMatch[3], 10) : actualEpStart;
+
+      if (actualSeason !== season || currentEp < actualEpStart || currentEp > actualEpEnd) {
+        // True redirect — different season or episode not in range
+        console.log(`[AC] EP ${currentEp}: redirect detected! Hash is #ep=${actualSeason},${actualEpStart}${hashMatch[3] ? "-" + actualEpEnd : ""} — skipping`);
+        const skipLabel = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp}`;
+        showAutoCaptureOverlay(`Auto-capture: ${skipLabel} (redirect — skipped)`);
+        await sleep(1000);
+        chrome.runtime.sendMessage({ type: "autoCaptureAdvance", skipped: true }, (resp) => {
+          if (chrome.runtime.lastError || !resp) return;
+          if (resp.hasNext) {
+            const nextHash = resp.hash || `#ep=${resp.season},${resp.nextEp}`;
+            location.hash = nextHash;
+            location.reload();
+          } else {
+            showAutoCaptureOverlay("Auto-capture complete!");
+            setTimeout(removeAutoCaptureOverlay, 3000);
+          }
+        });
+        return;
+      }
+      // Fall through to normal capture flow
+    }
+  }
+
+  if (multiSeason) {
+    const epLabel = endEp ? `EP ${currentEp}/${endEp}` : `EP ${currentEp}`;
+    showAutoCaptureOverlay(`Auto-capture: S${season} ${epLabel}`);
+  } else {
+    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp}`);
+  }
 
   // Clear seen state for the new episode — the page has reloaded so old
   // requests are gone, and we need seenM3u8 empty for the new m3u8.
@@ -495,7 +654,8 @@ async function runAutoCaptureHashReload(state) {
 
   // Retry once if not captured
   if (!captured) {
-    showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (retrying...)`);
+    const retryLabel = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp} of ${startEp}–${endEp}`;
+    showAutoCaptureOverlay(`Auto-capture: ${retryLabel} (retrying...)`);
     playBtn = document.querySelector("#player button.player-btn");
     if (playBtn) playBtn.click();
 
@@ -503,7 +663,7 @@ async function runAutoCaptureHashReload(state) {
     autoCaptureResolveEpisode = null;
 
     if (!captured && !autoCaptureAborted) {
-      showAutoCaptureOverlay(`Auto-capture: EP ${currentEp} of ${startEp}–${endEp} (skipped)`);
+      showAutoCaptureOverlay(`Auto-capture: ${retryLabel} (skipped)`);
       await sleep(1000);
     }
   }
@@ -511,11 +671,13 @@ async function runAutoCaptureHashReload(state) {
   if (autoCaptureAborted) return;
 
   // Ask background to advance; navigate to next episode with a full page reload
-  chrome.runtime.sendMessage({ type: "autoCaptureAdvance" }, (resp) => {
+  chrome.runtime.sendMessage({ type: "autoCaptureAdvance", skipped: !captured }, (resp) => {
     if (chrome.runtime.lastError || !resp) return;
 
     if (resp.hasNext) {
-      location.hash = `#ep=${resp.season},${resp.nextEp}`;
+      // Use discovered hash when available, fall back to constructed hash
+      const nextHash = resp.hash || `#ep=${resp.season},${resp.nextEp}`;
+      location.hash = nextHash;
       location.reload();
     } else {
       showAutoCaptureOverlay("Auto-capture complete!");
@@ -648,6 +810,21 @@ function inspectPageDom() {
   } else {
     lines.push("#season-select: NOT FOUND");
   }
+  lines.push("");
+
+  // Episode hash links (1movies.bz style: a[href*="#ep="])
+  const epLinks = document.querySelectorAll('a[href*="#ep="]');
+  lines.push(`EPISODE HASH LINKS (a[href*="#ep="]): ${epLinks.length} total`);
+  if (epLinks.length > 0) {
+    Array.from(epLinks).slice(0, 5).forEach((link) => {
+      const href = link.getAttribute("href");
+      const text = link.textContent.trim().slice(0, 60);
+      lines.push(`  href="${href}"  text="${text}"`);
+    });
+    if (epLinks.length > 5) {
+      lines.push(`  ... and ${epLinks.length - 5} more`);
+    }
+  }
 
   return lines.join("\n");
 }
@@ -680,6 +857,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         startEp: msg.startEp,
         endEp: msg.endEp,
         serverNum: msg.serverNum,
+        multiSeason: msg.multiSeason,
       });
     } else {
       // Hash-reload: navigate to first episode via hash change + reload
