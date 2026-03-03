@@ -80,6 +80,7 @@ class EpisodeInfo:
     ep_start: int
     ep_end: int
     imdb_id: Optional[str] = None
+    ep_title: Optional[str] = None
 
 
 # ========= EPISODE PARSING =========
@@ -91,6 +92,11 @@ EPISODE_PATTERNS = [
     ),
     re.compile(
         r"^(?P<show>.+?)\s*S(?P<season>\d+)\s*E(?P<e1>\d+)\b",
+        re.IGNORECASE
+    ),
+    # "Show 01 - Title" style (no season marker → defaults to Season 1)
+    re.compile(
+        r"^(?P<show>.+?)\s+(?P<e1>\d{1,3})\s*[-–]\s*(?P<title>.+)",
         re.IGNORECASE
     ),
 ]
@@ -107,9 +113,10 @@ def parse_episode_info(stem: str) -> Optional[EpisodeInfo]:
             continue
 
         show_raw = m.group("show").strip(" .-_")
-        season = int(m.group("season"))
+        season = int(m.group("season")) if m.groupdict().get("season") else 1
         e1 = int(m.group("e1"))
         e2 = int(m.group("e2")) if m.groupdict().get("e2") else e1
+        ep_title = m.group("title").strip() if m.groupdict().get("title") else None
 
         return EpisodeInfo(
             show_raw=show_raw,
@@ -118,6 +125,7 @@ def parse_episode_info(stem: str) -> Optional[EpisodeInfo]:
             ep_start=e1,
             ep_end=e2,
             imdb_id=imdb_id,
+            ep_title=ep_title,
         )
     return None
 
@@ -228,7 +236,10 @@ def process_tv(tv_root: Path, dry_run: bool = True) -> None:
             else f"E{ep.ep_start:02d}-E{ep.ep_end:02d}"
         )
 
-        base = f"{series_name} S{ep.season:02d}{ep_part}"
+        if ep.ep_title:
+            base = f"{series_name} - S{ep.season:02d}{ep_part} - {sanitize_for_windows(ep.ep_title)}"
+        else:
+            base = f"{series_name} S{ep.season:02d}{ep_part}"
         target_video = season_dir / f"{base}{video.suffix}"
 
         matching_subs = []
@@ -276,7 +287,10 @@ def process_tv(tv_root: Path, dry_run: bool = True) -> None:
             else f"E{ep.ep_start:02d}-E{ep.ep_end:02d}"
         )
 
-        base = f"{series_name} S{ep.season:02d}{ep_part}"
+        if ep.ep_title:
+            base = f"{series_name} - S{ep.season:02d}{ep_part} - {sanitize_for_windows(ep.ep_title)}"
+        else:
+            base = f"{series_name} S{ep.season:02d}{ep_part}"
         target_sub = season_dir / f"{base}{sub.suffix}"
 
         if dry_run:
