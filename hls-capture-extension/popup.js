@@ -191,7 +191,7 @@ const acSeasonEndWrap = document.getElementById("acSeasonEndWrap");
 const acSeasonEndInput = document.getElementById("acSeasonEndInput");
 const acEpWrap = document.getElementById("acEpWrap");
 
-const SUPPORTED_SITES = ["1movies.bz", "brocoflix.xyz"];
+const SUPPORTED_SITES = ["1movies", "brocoflix.xyz"];
 
 // Mode: "episodes" (single season, ep range) or "seasons" (multi-season, auto-detect ep count)
 let acMode = "episodes";
@@ -239,7 +239,7 @@ function updateAutoCaptureUI() {
       acSite.textContent = site;
 
       // Auto-fill season from URL hash on 1movies.bz (only if user hasn't manually edited it)
-      if (site === "1movies.bz" && !acSeasonDirty) {
+      if (site === "1movies" && !acSeasonDirty) {
         const season = parseSeasonFromUrl(tab.url);
         if (season !== null) acSeasonInput.value = season;
       }

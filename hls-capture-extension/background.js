@@ -6,7 +6,7 @@ const SEASON_INFO_URL = "http://localhost:9876/season-info";
 // ========= SITE CONFIGS =========
 
 const SITE_CONFIGS = {
-  "1movies.bz": {
+  "1movies": {
     navStrategy: "hash-reload",         // navigate via location.hash + reload
     makeEpisodeHash: (s, e) => `#ep=${s},${e}`,
     playButtonSelector: "#player button.player-btn",
