@@ -115,6 +115,8 @@ function renderDownloads(downloads) {
       const statusLabel = {
         queued: "queued",
         downloading: "downloading",
+        uploading: "uploading",
+        muxing: "muxing",
         moving: "moving file",
         done: "complete",
         error: "failed",

@@ -791,7 +791,35 @@ function inspectPageDom() {
   lines.push("EPISODE CARDS (first 3):");
   const cards = document.querySelectorAll(".episode-card");
   if (cards.length === 0) {
-    lines.push("  none found — is the episode grid loaded?");
+    lines.push("  .episode-card: none found");
+    // Broader search for anything that looks like an episode list
+    const epCandidates = document.querySelectorAll(
+      "[class*='episode'], [class*='Episode'], [data-episode], [data-ep], " +
+      "[class*='ep-item'], [class*='ep_item'], [class*='epItem']"
+    );
+    if (epCandidates.length > 0) {
+      lines.push(`  Possible episode elements (${epCandidates.length} found):`);
+      Array.from(epCandidates).slice(0, 5).forEach((el) => {
+        const tag = el.tagName.toLowerCase();
+        const attrs = Array.from(el.attributes).map(a => `${a.name}="${a.value}"`).join(" ");
+        const text = el.textContent.trim().slice(0, 60);
+        lines.push(`    <${tag} ${attrs}>`);
+        if (text) lines.push(`      "${text}"`);
+      });
+    } else {
+      lines.push("  No [class*='episode'] or [data-episode] elements found either");
+      // Last resort: show clickable list items near the player
+      const listItems = document.querySelectorAll("li a, .list-group-item, [role='listitem']");
+      if (listItems.length > 0) {
+        lines.push(`  Generic list items (${listItems.length} found, first 5):`);
+        Array.from(listItems).slice(0, 5).forEach((el) => {
+          const tag = el.tagName.toLowerCase();
+          const cls = el.className?.toString().slice(0, 80) || "";
+          const text = el.textContent.trim().slice(0, 60);
+          lines.push(`    <${tag} class="${cls}"> "${text}"`);
+        });
+      }
+    }
   } else {
     Array.from(cards).slice(0, 3).forEach((card) => {
       lines.push(`  data-season="${card.dataset.season}" data-episode="${card.dataset.episode}" class="${card.className}"`);
@@ -834,7 +862,68 @@ function inspectPageDom() {
 // Set up site-specific DOM listeners
 if (getCurrentSite() === "brocoflix.xyz") {
   setupBrocoflixListeners();
+
+  // Diagnostic: log BrocoFlix DOM state to service worker console
+  setTimeout(() => {
+    const cards = document.querySelectorAll(".episode-card");
+    const playBtns = document.querySelectorAll(".episode-play-button");
+    const serverBtns = document.querySelectorAll(".server-button");
+    const seasonSel = document.querySelector("#season-select");
+    const showTitle = getShowTitleFromDom();
+    // Send a dedicated diagnostic message (not setEpisodeContext — that pollutes state)
+    chrome.runtime.sendMessage({
+      type: "brocoflixDiag",
+      info: `title="${showTitle}" cards=${cards.length} playBtns=${playBtns.length} serverBtns=${serverBtns.length} seasonSelect=${!!seasonSel}`,
+    });
+  }, 3000);
 }
+
+// ========= BROCOFLIX CHUNK RELAY =========
+// Relay MAIN-world download chunks to background service worker, which
+// forwards them to the local server.  This relay is needed because:
+// 1. MAIN-world can't POST to localhost (mixed content / CSP)
+// 2. MV3 content scripts share the page's network context, not the extension's
+// So we relay through chrome.runtime.sendMessage → background → localhost.
+
+window.addEventListener("message", (e) => {
+  const msg = e.data;
+  if (!msg?.type?.startsWith("hlsBroco")) return;
+
+  if (msg.type === "hlsBrocoLog") {
+    // Relay MAIN-world log to service worker console (iframe console is inaccessible)
+    chrome.runtime.sendMessage({ type: "brocoflixLog", msg: msg.msg });
+  } else if (msg.type === "hlsBrocoStart") {
+    console.log(`[BF-relay] Download starting: ${msg.totalChunks} segments`);
+  } else if (msg.type === "hlsBrocoChunk") {
+    // Decode base64 to binary and POST to server via background
+    const { sessionId, chunkIndex, totalChunks, data } = msg;
+    // Send chunk to background which POSTs to localhost
+    chrome.runtime.sendMessage({
+      type: "brocoflixChunkData",
+      sessionId,
+      chunkIndex,
+      totalChunks,
+      data,  // base64 string
+    }, (resp) => {
+      if (chrome.runtime.lastError) {
+        console.log(`[BF-relay] chunk ${chunkIndex} send failed: ${chrome.runtime.lastError.message}`);
+      }
+    });
+  } else if (msg.type === "hlsBrocoDone") {
+    console.log(`[BF-relay] All segments downloaded, signaling done`);
+    chrome.runtime.sendMessage({
+      type: "brocoflixDoneSignal",
+      sessionId: msg.sessionId,
+    });
+  } else if (msg.type === "hlsBrocoError") {
+    console.log(`[BF-relay] Download error: ${msg.error}`);
+    chrome.runtime.sendMessage({
+      type: "brocoflixErrorSignal",
+      sessionId: msg.sessionId,
+      error: msg.error,
+    });
+  }
+});
 
 // On content script load, check if auto-capture is in progress for this tab
 checkAutoCaptureOnLoad();
