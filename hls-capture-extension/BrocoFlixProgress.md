@@ -1,11 +1,14 @@
 # BrocoFlix Browser-Side Download — Progress Log
 
-## Status: WORKING — movies download at ~99.4% completion (2026-03-24)
+## Status: SERVICE WORKER DOWNLOAD IN PROGRESS (2026-03-27)
 
-Movies and TV episodes both download successfully. TV episodes achieve 100%. Movies achieve ~99.3-99.4% due to persistent per-IP CDN segment blocking that cannot be recovered by any retry strategy tested so far.
+Movies and TV episodes both download successfully. TV episodes achieve 100%. Movies achieve ~99.3-99.4% with both the old MAIN-world approach and the new service worker approach. A new architecture (service worker fetch + declarativeNetRequest header spoofing) has been implemented but not fully tested — the 0ms throttle run needs testing.
 
 ## What Works
-- Full relay chain: MAIN-world iframe → postMessage → content script → background → server
+- **NEW: Service worker download path** (FetchV-style) — fetches segments directly from background.js service worker, bypassing MAIN-world HTTP/2 socket pool entirely
+- **NEW: declarativeNetRequest** header spoofing — rewrites Origin and Referer headers at Chrome's network stack level so CDN accepts service worker requests
+- **PRESERVED: MAIN-world fallback** — old relay chain still intact, auto-activates if SW manifest fetch fails
+- Full relay chain (fallback): MAIN-world iframe → postMessage → content script → background → server
 - Server receives and writes chunks to disk (confirmed with server-side chunk logging)
 - Session lifecycle: `/brocoflix-start` → `/brocoflix-chunk` → `/brocoflix-done` (mux) or `/brocoflix-abort`
 - Popup shows "uploading" status with chunk progress
@@ -20,23 +23,43 @@ Movies and TV episodes both download successfully. TV episodes achieve 100%. Mov
 
 ## Architecture Overview
 
-### How the download works
+### NEW: Service worker download (primary path, as of 2026-03-27)
 1. `webRequest.onBeforeRequest` intercepts m3u8 URL from BrocoFlix embed iframe
 2. m3u8 goes into pending queue → quality probed from iframe → preview dialog shown
-3. User confirms → `startBrocoflixDownload()` called with tabId and frameId
-4. `chrome.scripting.executeScript({ world: "MAIN" })` injects `brocoflixDownloaderFunc` into the embed iframe (origin: `streameeeeee.site` or `vidsrc.cc`)
-5. Injected function runs in iframe's MAIN world — CDN accepts requests from this origin
-6. Downloads each TS segment sequentially via `fetch()`, converts to base64, sends via `window.postMessage`
-7. Content script (ISOLATED world) receives postMessage → `chrome.runtime.sendMessage` → background service worker
-8. Background decodes base64, POSTs raw binary to `/brocoflix-chunk` on localhost:9876
-9. On completion: `/brocoflix-done` → server runs `ffmpeg -i temp.ts -c copy -movflags +faststart output.mp4`
-10. Server runs `fix_file_names.py` post-mux to normalize filename via OMDb
+3. User confirms → `startBrocoflixDownload()` → `runBrocoflixSwDownload()`
+4. `webRequest.onSendHeaders` captures CDN request headers (Origin, Referer) from iframe's HLS player
+5. `declarativeNetRequest` dynamic rules set to rewrite Origin→`https://streameeeeee.site` and Referer on all requests to CDN domains
+6. Service worker kills the video player in the iframe (frees CDN bandwidth)
+7. Service worker fetches m3u8 manifest directly, parses segment list
+8. **Key step**: Extracts ALL unique CDN domains from segment URLs (manifest domain ≠ segment domain!) and updates DNR rules to cover all of them
+9. Service worker fetches each segment sequentially via `fetch()` with `credentials: "include"` and `cache: "no-store"`
+10. POSTs raw binary ArrayBuffer directly to `/brocoflix-chunk` on localhost:9876 (no base64 encoding needed)
+11. On completion: `/brocoflix-done` → server muxes TS → MP4
 
-### Why this relay chain is necessary
-- CDN domains (silvercloud9.pro, mistwolf88.xyz, bluehorizon4.site, stormfox27.live, etc.) **403 ALL non-browser clients** (yt-dlp, curl, wget, service worker fetch)
-- MAIN-world can't POST to localhost (mixed content: HTTPS page → HTTP server, plus CSP)
-- MV3 content scripts share the page's network context, can't fetch arbitrary URLs
-- Background service worker can fetch localhost freely
+### Why the service worker approach works
+- **declarativeNetRequest** rewrites Origin header at Chrome's network stack level — bypasses the "forbidden header" restriction in fetch() API
+- Service worker has a **separate HTTP/2 socket pool** from the page — immune to GOAWAY poisoning
+- **No base64 encoding** — direct ArrayBuffer POST saves ~33% memory overhead
+- **No relay chain** — service worker POSTs directly to localhost (no content script middleman)
+- CDN accepts requests because DNR makes them look identical to iframe-origin requests
+
+### Important: CDN uses different domains for manifest vs segments
+The m3u8 manifest and the TS segments are often on DIFFERENT CDN domains. For example:
+- Manifest: `stormfox27.live`
+- Segments: `icynebula71.pro`
+
+DNR rules must cover ALL domains. The code extracts segment domains after parsing the manifest and updates rules accordingly.
+
+### FALLBACK: MAIN-world relay chain (old approach, auto-activates if SW manifest fetch fails)
+1. `chrome.scripting.executeScript({ world: "MAIN" })` injects `brocoflixDownloaderFunc` into the embed iframe
+2. Downloads each TS segment via fetch(), converts to base64, sends via `window.postMessage`
+3. Content script receives postMessage → `chrome.runtime.sendMessage` → background service worker
+4. Background decodes base64, POSTs to `/brocoflix-chunk`
+
+### Why the MAIN-world fallback exists
+- If the CDN changes its validation and starts rejecting service worker requests even with DNR header spoofing
+- If `declarativeNetRequest` permission is unavailable
+- The old relay chain is preserved intact in the codebase
 
 ### Iframe reload recovery
 When segments fail mid-download, the downloader:
@@ -186,31 +209,52 @@ The ~50% of failures that persist even across iframe reloads (fresh CDN domains,
 - **Persistent**: Blocked segments never recover across any tested delay (up to minutes between retries)
 - **Not pattern-based**: Full sequential re-fetch (blending retries into normal playback stream) didn't help
 
-## Current Implementation (as of 2026-03-24)
+## Current Implementation (as of 2026-03-27)
 
-### Download flow (`brocoflixDownloaderFunc` in background.js)
-- Kills video player (`<video>` elements + JWPlayer/HLS.js) before starting download
-- Sequential download at 500ms/segment base pace
+### Service worker download flow (`runBrocoflixSwDownload` in background.js)
+- Extracts CDN domain from m3u8 URL, determines embed origin from captured headers or defaults to `https://streameeeeee.site`
+- Sets `declarativeNetRequest` dynamic rules: Origin + Referer for manifest CDN domain
+- Kills video player in iframe via `chrome.scripting.executeScript`
+- Fetches m3u8 manifest from service worker, parses segment URLs
+- Extracts ALL unique CDN domains from segments, updates DNR rules to cover all of them
+- Sequential download with **0ms throttle** (FetchV proves CDN accepts rapid requests from trusted origin)
+- 30s abort timeout per segment via AbortController
+- `credentials: "include"`, `cache: "no-store"` on each fetch
 - Skip-and-continue: failed segments are skipped, download continues to end of manifest
-- Proactive iframe reload every 800 segments (before GOAWAY threshold)
-- After pass completes with failures → request iframe reload
-- Retry pass (≤20 remaining segments): 10s between each fetch, `MAX_CONSECUTIVE_FAILS = remaining + 1` (complete the full loop, don't break early)
-- `fetchWithTimeout` default 30s, `cache: "no-store"`
-- Chunks sent to server in order via `flushToServer()` buffer
+- **No proactive reload** (disabled for SW path — no GOAWAY in SW's separate socket pool)
+- After pass completes with failures → request iframe reload via `handleBrocoflixReload()`
+- Retry pass (≤20 remaining segments): 3s between each fetch
+- Chunks POSTed as raw ArrayBuffer to `/brocoflix-chunk` with binary `Content-Type: application/octet-stream`
+- Chunks sent in order via `flushToServer()` buffer
+- Falls back to MAIN-world `injectMainWorldDownloader()` if manifest fetch fails
 
-### Iframe reload mechanism
+### Refactored shared functions (2026-03-27)
+- `handleBrocoflixReload()` — reload logic shared between SW downloader and MAIN-world fallback message handler
+- `finalizeBrocoflixDownload()` — mux trigger shared between both paths
+- `triggerAutoCaptureEpisodeDone()` — auto-capture signal shared between both paths
+- `injectMainWorldDownloader()` — wraps old MAIN-world injection as named fallback
+
+### Iframe reload mechanism (unchanged)
 - Background clears iframe src, waits 500ms, restores with `autoPlay=true` URL param
 - Auto-clicks `#btn-play` button via `chrome.scripting.executeScript({ allFrames: true })`
 - Each reload cancels previous reload's safety timer (fixes stale timer abort bug)
 - 120s safety timeout per reload (aborts if no new m3u8 intercepted)
 - `seenM3u8` cleared before reload to allow re-interception
+- On resume: new m3u8 → `startBrocoflixDownload()` → `runBrocoflixSwDownload()` with new CDN domain + new DNR rules
 
-### Give-up logic
+### Give-up logic (unchanged)
 - `TARGET_PCT = 99.5%`
 - `MAX_NO_PROGRESS_RELOADS = 3` — stall counter increments when no new segments recovered
 - `MAX_TOTAL_RELOADS = 15` — hard limit
 - Give up when: (meets 99.5% AND stalled ≥3) OR (stalled ≥5 even if below target) OR (reloads ≥15)
 - On give-up: POST `/brocoflix-done` → server muxes whatever chunks were received
+
+### declarativeNetRequest details
+- Permission: `"declarativeNetRequest"` in manifest.json
+- Rule ID 1: sets both Origin and Referer headers on requests matching CDN domains
+- `requestDomains` condition (no resourceTypes filter — applies to all request types including SW fetches)
+- Rules updated dynamically: set on download start, updated after manifest parse (segment domains), updated on reload (new CDN domain), cleared when last session finishes
+- `setCdnHeaderRules(domains, embedOrigin)` accepts string or array of domains
 
 ### Confirmation popup
 - BrocoFlix m3u8 goes through same pending/preview/confirm flow as 1movies
@@ -280,5 +324,69 @@ Each page load fires 2-3 webRequest events for the same m3u8 URL. `seenM3u8` Set
 - Movie output: `C:\Temp_Media\Movies\{title}.mp4`
 - TV output: `C:\Temp_Media\TV Shows\{title} SxxExx.mp4`
 
-### FetchV extension reference
-An existing HLS downloader extension (FetchV) can download from BrocoFlix. It sometimes errors but has a "convert to single thread" button that usually allows it to complete the download. This suggests 100% completion is achievable from JavaScript in the browser.
+### FetchV extension reference — reverse-engineered (2026-03-27)
+FetchV (nfmmmhanepmpifddlkkmihkalkoekpfd) can download from BrocoFlix at 100% with zero errors in ~3 minutes for an 881-segment movie.
+
+**How FetchV works (from source analysis + GitHub daoquangphuong/fetchv):**
+1. `webRequest.onBeforeSendHeaders` captures ALL original request headers from the m3u8/segment requests
+2. Opens a dedicated tab (`fetchv.net/m3u8downloader`) where its content script (`m3u8downloader.js`) manages the download
+3. Content script sends `FETCH_DATA` messages to the service worker for each segment
+4. **Service worker fetches each segment** using `fetch(url, {mode: "cors", credentials: "include", headers: capturedHeaders})`
+5. Returns binary data to content script → merges segments → writes final MP4 via Blob download
+6. Multi-threaded by default (configurable thread count); "convert to single thread" reduces to 1 concurrent request
+7. Auto-pauses after 30+ errors, user can reduce threads and resume
+8. 30s timeout per segment via AbortController
+9. Permissions: `webRequest`, `tabs`, `storage` + `host_permissions: ["<all_urls>"]`
+10. Also has "record mode" fallback: hooks `MediaSource` + `SourceBuffer.appendBuffer()` to capture decoded video during playback (real-time speed)
+
+**Key FetchV findings that informed our SW approach:**
+- FetchV downloads from the **service worker**, NOT from MAIN-world — uses separate HTTP/2 socket pool
+- FetchV passes captured headers via fetch()'s `headers` param (not declarativeNetRequest)
+- FetchV uses `credentials: "include"` to send cookies
+- The dedicated download tab (`fetchv.net/m3u8downloader`) means downloads happen in a completely separate tab context
+- "Convert to single thread" = sequential download (like our approach), fixes CDN rate limiting
+
+## Service Worker Download — Development Log (2026-03-27)
+
+### Iteration 1: Basic SW fetch with captured headers
+- Added `onSendHeaders` listener to capture CDN request headers
+- Service worker fetched m3u8 and segments directly with `mode: "cors"`, `credentials: "include"`, replayed headers
+- **Result: 403 on m3u8 fetch.** Only captured `User-Agent` and `Accept` — header filter matched `.ts`/`.m3u8` extensions but CDN URLs use `/file1/<token>` paths without extensions. Also, `Origin` is a forbidden header in fetch() — can't be set.
+- Fell back to MAIN-world downloader automatically.
+
+### Iteration 2: declarativeNetRequest header spoofing
+- Added `declarativeNetRequest` permission to manifest.json
+- `setCdnHeaderRules()` dynamically adds rules to rewrite Origin and Referer on CDN domain requests
+- Fixed header capture filter: match `/file1/` and `/pl/` URL paths instead of file extensions
+- **Result: 403 on all segments.** Manifest fetched successfully (881 segments parsed), but segments returned 403.
+- Root cause: **manifest domain ≠ segment domain!** m3u8 on `bluehorizon4.site`, segments on `nebulacat8.site`. DNR rules only covered manifest domain.
+
+### Iteration 3: Multi-domain DNR rules
+- After parsing manifest, extract all unique CDN domains from segment URLs
+- Update DNR rules to cover ALL domains (manifest + segments)
+- Also fixed `chrome.tabs.get(tabId)` crash when `tabId = -1` (SW's own fetches trigger `onBeforeRequest`)
+- **Result: 876/881 (99.4%) — same as MAIN-world approach.**
+- 5 persistent failures at same indices (261, 343, 447, 545, 607) across all CDN domain rotations
+- Errors are "Failed to fetch" (connection-level), not HTTP 403
+- 2 iframe reloads occurred, same segments failed every time
+- This confirms: the 5 persistent failures are NOT caused by HTTP/2 GOAWAY (SW has separate pool)
+
+### Iteration 4: Remove throttle (NOT YET TESTED)
+- Set `THROTTLE_MS = 0` for main pass (was 500ms) — FetchV proves CDN accepts rapid requests
+- Disabled proactive reload at 800 segments (no GOAWAY in SW pool)
+- Retry pass throttle reduced from 10s to 3s
+- **Needs testing** — if same 5 segments still fail at full speed, the issue is not timing-related
+
+### Remaining gap: 5 persistent segment failures
+The same 5 segment indices fail with both MAIN-world and service worker approaches, across all CDN domains. FetchV downloads the same movie at 100% with zero errors. Possible remaining differences:
+1. **FetchV replays ALL captured headers** directly in fetch() (not just Origin/Referer via DNR) — may include headers we're not sending
+2. **FetchV downloads from a separate tab** (fetchv.net/m3u8downloader) — completely isolated context
+3. **Speed** — FetchV at ~200ms/segment vs our 500ms may avoid token expiry or CDN pattern detection
+4. **Threading** — FetchV defaults to multi-threaded (multiple concurrent requests)
+
+### Next steps to try
+1. **Test 0ms throttle** — see if speed alone fixes the 5 failures
+2. **If still failing**: try passing ALL captured headers (not just Origin/Referer) directly in fetch() alongside DNR
+3. **If still failing**: try multi-threaded download (2-4 concurrent fetches) like FetchV's default mode
+4. **If still failing**: try offscreen document approach (Chrome MV3 offscreen API provides yet another network context)
+5. **Nuclear option**: MSE record mode — hook MediaSource.appendBuffer() to capture decoded video during normal playback (real-time speed, guaranteed 100%)

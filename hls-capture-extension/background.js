@@ -79,10 +79,85 @@ let autoCapture = {
 
 // ========= NETWORK INTERCEPTION =========
 
+// Capture CDN request headers so the service worker can replay them when
+// fetching segments directly (FetchV-style approach). We grab headers from
+// CDN requests made by the embed iframe's HLS player.
+const capturedCdnHeaders = new Map(); // tabId -> { headers, origin, referer }
+
+chrome.webRequest.onSendHeaders.addListener(
+  (details) => {
+    // Only capture sub-frame requests (the embed iframe fetches segments)
+    if (details.frameId === 0) return;
+    if (details.tabId < 0) return;
+    // Match CDN URL patterns: /file1/<token> or /pl/<token>
+    const url = details.url;
+    if (!url.includes("/file1/") && !url.includes("/pl/")) return;
+
+    const headers = {};
+    let origin = "";
+    let referer = "";
+    for (const h of details.requestHeaders || []) {
+      const name = h.name.toLowerCase();
+      headers[h.name] = h.value;
+      if (name === "origin") origin = h.value;
+      if (name === "referer") referer = h.value;
+    }
+
+    capturedCdnHeaders.set(details.tabId, { headers, origin, referer, capturedAt: Date.now() });
+  },
+  { urls: ["<all_urls>"] },
+  ["requestHeaders"]
+);
+
+// ========= declarativeNetRequest: spoof Origin/Referer for CDN requests =========
+// The CDN 403s requests that don't come from the embed iframe origin.
+// Service worker fetch() can't set Origin (forbidden header), so we use
+// declarativeNetRequest to rewrite it at the network stack level.
+// Rules are added dynamically when a download starts and removed when it finishes.
+
+const DNR_RULE_ID_ORIGIN = 1;
+const DNR_RULE_ID_REFERER = 2;
+
+async function setCdnHeaderRules(cdnDomains, embedOrigin) {
+  // cdnDomains can be a string (single domain) or array of domains
+  const domains = Array.isArray(cdnDomains) ? cdnDomains : [cdnDomains];
+
+  const rules = [
+    {
+      id: DNR_RULE_ID_ORIGIN,
+      priority: 1,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          { header: "Origin", operation: "set", value: embedOrigin },
+          { header: "Referer", operation: "set", value: embedOrigin + "/" },
+        ],
+      },
+      condition: {
+        // Match all requests to any of these CDN domains
+        requestDomains: domains,
+      },
+    },
+  ];
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    addRules: rules,
+    removeRuleIds: [DNR_RULE_ID_ORIGIN, DNR_RULE_ID_REFERER],
+  });
+  console.log(`[BF-sw] DNR rules set: Origin=${embedOrigin} for ${domains.join(", ")}`);
+}
+
+async function clearCdnHeaderRules() {
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [DNR_RULE_ID_ORIGIN, DNR_RULE_ID_REFERER],
+  });
+}
+
 // Listen for m3u8 and subtitle requests
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.type === "main_frame") return;
+    if (details.tabId < 0) return; // skip service worker's own fetches
 
     const url = details.url;
     const tabId = details.tabId;
@@ -553,6 +628,475 @@ function cleanupBrocoflixSession(sessionId) {
   const session = brocoflixSessions.get(sessionId);
   if (session?.m3u8Url) brocoflixActiveUrls.delete(session.m3u8Url);
   brocoflixSessions.delete(sessionId);
+  // Clean up DNR rules if no more active BrocoFlix sessions
+  if (brocoflixSessions.size === 0) {
+    clearCdnHeaderRules().catch(() => {});
+  }
+}
+
+// ========= SERVICE WORKER DOWNLOAD (FetchV-style) =========
+// Fetches HLS segments directly from the service worker instead of injecting
+// into the MAIN world. This uses a separate HTTP/2 socket pool, avoiding the
+// GOAWAY poisoning that causes permanent segment failures in iframe-based fetching.
+
+async function fetchSegmentManifest(m3u8Url) {
+  const resp = await fetch(m3u8Url, {
+    mode: "cors",
+    credentials: "include",
+  });
+  if (!resp.ok) throw new Error(`m3u8 fetch failed: ${resp.status}`);
+  const manifest = await resp.text();
+
+  let mediaManifest = manifest;
+  let baseUrl = m3u8Url;
+
+  // If master playlist, select highest bandwidth variant
+  if (manifest.includes("#EXT-X-STREAM-INF")) {
+    const lines = manifest.split("\n");
+    let bestBw = -1;
+    let bestUrl = null;
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/#EXT-X-STREAM-INF:.*BANDWIDTH=(\d+)/);
+      if (m && i + 1 < lines.length) {
+        const bw = parseInt(m[1], 10);
+        if (bw > bestBw) {
+          bestBw = bw;
+          bestUrl = lines[i + 1].trim();
+        }
+      }
+    }
+    if (!bestUrl) throw new Error("No variants found in master playlist");
+
+    const variantUrl = bestUrl.startsWith("http")
+      ? bestUrl
+      : new URL(bestUrl, m3u8Url).href;
+
+    const varResp = await fetch(variantUrl, {
+      mode: "cors",
+      credentials: "include",
+    });
+    if (!varResp.ok) throw new Error(`Variant fetch failed: ${varResp.status}`);
+    mediaManifest = await varResp.text();
+    baseUrl = variantUrl;
+  }
+
+  return mediaManifest
+    .split("\n")
+    .filter((line) => line.trim() && !line.startsWith("#"))
+    .map((line) =>
+      line.trim().startsWith("http")
+        ? line.trim()
+        : new URL(line.trim(), baseUrl).href
+    );
+}
+
+async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndices) {
+  const alreadyDone = new Set(completedIndices || []);
+  const session = brocoflixSessions.get(sessionId);
+  if (!session) {
+    console.log(`[BF-sw] No session for ${sessionId}`);
+    return;
+  }
+
+  // Determine the CDN domain and embed origin from the m3u8 URL
+  let cdnDomain;
+  try {
+    cdnDomain = new URL(m3u8Url).hostname;
+  } catch {
+    console.log(`[BF-sw] Cannot parse m3u8 URL`);
+    injectMainWorldDownloader(sessionId, m3u8Url, tabId, session.frameId, completedIndices);
+    return;
+  }
+
+  // Determine embed origin from captured headers, or use known embed origins
+  const captured = capturedCdnHeaders.get(tabId);
+  const embedOrigin = captured?.origin || "https://streameeeeee.site";
+  console.log(`[BF-sw] CDN domain: ${cdnDomain}, embed origin: ${embedOrigin}`);
+
+  // Set declarativeNetRequest rules to spoof Origin and Referer on CDN requests.
+  // This is the key trick — fetch() can't set Origin (forbidden header), but DNR
+  // rewrites it at the network stack level before the request leaves Chrome.
+  try {
+    await setCdnHeaderRules(cdnDomain, embedOrigin);
+  } catch (err) {
+    console.log(`[BF-sw] DNR rules failed: ${err.message}`);
+    injectMainWorldDownloader(sessionId, m3u8Url, tabId, session.frameId, completedIndices);
+    return;
+  }
+
+  // Pause the video player to stop competing for CDN bandwidth
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [session.frameId] },
+      world: "MAIN",
+      func: () => {
+        const videos = document.querySelectorAll("video");
+        videos.forEach(v => { v.pause(); v.src = ""; v.load(); });
+        if (window.jwplayer) try { window.jwplayer().remove(); } catch {}
+        if (window.hls) try { window.hls.destroy(); } catch {}
+        if (window.player?.destroy) try { window.player.destroy(); } catch {}
+        return videos.length;
+      },
+    });
+    console.log(`[BF-sw] Paused video player`);
+  } catch (e) {
+    console.log(`[BF-sw] Video pause failed (non-fatal): ${e.message}`);
+  }
+
+  let segments;
+  try {
+    segments = await fetchSegmentManifest(m3u8Url);
+  } catch (err) {
+    console.log(`[BF-sw] Manifest fetch failed: ${err.message}`);
+    console.log(`[BF-sw] Falling back to MAIN-world downloader`);
+    await clearCdnHeaderRules();
+    injectMainWorldDownloader(sessionId, m3u8Url, tabId, session.frameId, completedIndices);
+    return;
+  }
+
+  if (segments.length === 0) {
+    console.log(`[BF-sw] No segments found in manifest`);
+    return;
+  }
+
+  // Segments may be on a different CDN domain than the manifest.
+  // Collect all unique segment domains and set DNR rules for each.
+  const segDomains = new Set();
+  segDomains.add(cdnDomain); // manifest domain
+  for (const segUrl of segments) {
+    try { segDomains.add(new URL(segUrl).hostname); } catch {}
+  }
+  const allDomains = [...segDomains];
+  console.log(`[BF-sw] CDN domains: manifest=${cdnDomain}, segments=${allDomains.join(", ")}`);
+
+  // Update DNR rules to cover ALL CDN domains (manifest + segments)
+  try {
+    await setCdnHeaderRules(allDomains, embedOrigin);
+  } catch (err) {
+    console.log(`[BF-sw] DNR rule update for segment domains failed: ${err.message}`);
+  }
+
+  const totalSegs = segments.length;
+  const remaining = totalSegs - alreadyDone.size;
+  const isRetryPass = remaining <= 20 && alreadyDone.size > 0;
+  // No throttle for main pass — FetchV proves CDN accepts rapid requests from
+  // a trusted origin. Retry pass uses short delay to space out retries.
+  const THROTTLE_MS = isRetryPass ? 3000 : 0;
+  const MAX_CONSECUTIVE_FAILS = isRetryPass ? remaining + 1 : 10;
+
+  console.log(`[BF-sw] ${totalSegs} segments, ${alreadyDone.size} done, ${remaining} remaining${isRetryPass ? ` (RETRY PASS: ${THROTTLE_MS / 1000}s between fetches)` : ""}`);
+
+  let segsFetchedThisCycle = 0;
+  let consecutiveFails = 0;
+  const failedThisCycle = [];
+  const allCompleted = new Set(alreadyDone);
+
+  // Ordered send: buffer downloaded data and flush in order
+  const downloaded = new Array(totalSegs).fill(null);
+  let sendCursor = 0;
+  while (sendCursor < totalSegs && alreadyDone.has(sendCursor)) sendCursor++;
+
+  async function flushToServer() {
+    while (sendCursor < totalSegs) {
+      if (alreadyDone.has(sendCursor)) { sendCursor++; continue; }
+      if (downloaded[sendCursor] === null) break;
+      try {
+        await fetch("http://localhost:9876/brocoflix-chunk", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Session-Id": sessionId,
+            "X-Chunk-Index": String(sendCursor),
+            "X-Total-Chunks": String(totalSegs),
+          },
+          body: downloaded[sendCursor],
+        });
+      } catch (err) {
+        console.log(`[BF-sw] chunk ${sendCursor} POST failed: ${err.message}`);
+      }
+      downloaded[sendCursor] = null; // free memory
+      sendCursor++;
+    }
+  }
+
+  let needsReload = false;
+  let reloadReason = "";
+
+  for (let segIdx = 0; segIdx < totalSegs; segIdx++) {
+    if (alreadyDone.has(segIdx)) continue;
+
+    // Check if session was aborted
+    if (!brocoflixSessions.has(sessionId)) {
+      console.log(`[BF-sw] Session ${sessionId} was cleaned up, stopping`);
+      return;
+    }
+
+    // Proactive reload — disabled for SW path (no GOAWAY in SW socket pool).
+    // Only enable if we observe GOAWAY-like failures from the SW.
+    if (false && BROCOFLIX_RELOAD_THRESHOLD > 0 && segsFetchedThisCycle >= BROCOFLIX_RELOAD_THRESHOLD) {
+      await flushToServer();
+      needsReload = true;
+      reloadReason = "proactive";
+      console.log(`[BF-sw] Proactive reload after ${segsFetchedThisCycle} segments. ${allCompleted.size}/${totalSegs} total done.`);
+      break;
+    }
+
+    let ok = false;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30000);
+      const segResp = await fetch(segments[segIdx], {
+        signal: controller.signal,
+        mode: "cors",
+        credentials: "include",
+        cache: "no-store",
+      });
+      clearTimeout(timer);
+      if (!segResp.ok) throw new Error(`HTTP ${segResp.status}`);
+      const arrayBuf = await segResp.arrayBuffer();
+      downloaded[segIdx] = arrayBuf;
+      ok = true;
+    } catch (err) {
+      console.log(`[BF-sw] Segment ${segIdx} FAILED: ${err.message}`);
+    }
+
+    if (ok) {
+      segsFetchedThisCycle++;
+      consecutiveFails = 0;
+      allCompleted.add(segIdx);
+      await flushToServer();
+
+      if (allCompleted.size % 50 === 0) {
+        console.log(`[BF-sw] Progress: ${allCompleted.size}/${totalSegs} done (cycle: ${segsFetchedThisCycle}, skipped: ${failedThisCycle.length})`);
+      }
+    } else {
+      failedThisCycle.push(segIdx);
+      consecutiveFails++;
+
+      if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
+        await flushToServer();
+        needsReload = true;
+        reloadReason = "consecutive_fails";
+        console.log(`[BF-sw] ${MAX_CONSECUTIVE_FAILS} consecutive failures. ${allCompleted.size}/${totalSegs} done. Requesting reload...`);
+        break;
+      }
+    }
+
+    await new Promise(r => setTimeout(r, THROTTLE_MS));
+  }
+
+  await flushToServer();
+
+  // Handle failures / reload request
+  if (!needsReload && failedThisCycle.length > 0) {
+    needsReload = true;
+    reloadReason = "retry_failures";
+    console.log(`[BF-sw] Pass complete. ${allCompleted.size}/${totalSegs} done, ${failedThisCycle.length} failed: [${failedThisCycle.join(",")}]. Requesting reload...`);
+  }
+
+  if (needsReload) {
+    handleBrocoflixReload(sessionId, [...allCompleted], totalSegs, reloadReason);
+    return;
+  }
+
+  // All segments downloaded!
+  console.log(`[BF-sw] All ${totalSegs} segments complete!`);
+  finalizeBrocoflixDownload(sessionId);
+}
+
+// Extracted reload logic so it can be called from both the SW downloader
+// and the message handler (for MAIN-world fallback)
+function handleBrocoflixReload(sessionId, completedIndices, totalSegments, reason) {
+  const session = brocoflixSessions.get(sessionId);
+  if (!session) {
+    console.log(`[BF] Reload requested for unknown session ${sessionId}`);
+    return;
+  }
+
+  const tabId = session.tabId;
+
+  // Track reload count and detect if we're stuck
+  session.reloadCount = (session.reloadCount || 0) + 1;
+  const prevCompleted = session.lastCompletedCount || 0;
+  session.lastCompletedCount = completedIndices.length;
+  const madeProgress = completedIndices.length > prevCompleted;
+  const MAX_NO_PROGRESS_RELOADS = 3;
+  const MAX_TOTAL_RELOADS = 15;
+
+  if (!madeProgress) {
+    session.noProgressReloads = (session.noProgressReloads || 0) + 1;
+  } else {
+    session.noProgressReloads = 0;
+  }
+
+  const completionPct = (completedIndices.length / totalSegments * 100).toFixed(1);
+  const missing = totalSegments - completedIndices.length;
+  const TARGET_PCT = 99.5;
+  const meetsTarget = parseFloat(completionPct) >= TARGET_PCT;
+
+  console.log(`[BF] Iframe reload #${session.reloadCount} (${reason}): ${completedIndices.length}/${totalSegments} (${completionPct}%) done, ${missing} missing, progress=${madeProgress}, stalled=${session.noProgressReloads}/${MAX_NO_PROGRESS_RELOADS}`);
+
+  const shouldGiveUp = (meetsTarget && session.noProgressReloads >= MAX_NO_PROGRESS_RELOADS)
+    || session.noProgressReloads >= MAX_NO_PROGRESS_RELOADS + 2
+    || session.reloadCount >= MAX_TOTAL_RELOADS;
+  if (shouldGiveUp) {
+    const reason2 = session.reloadCount >= MAX_TOTAL_RELOADS
+      ? `Hit max ${MAX_TOTAL_RELOADS} reloads`
+      : meetsTarget
+        ? `Reached ${completionPct}% (>= ${TARGET_PCT}% target) and stalled`
+        : `Stalled at ${completionPct}% (${missing} segments permanently blocked by CDN)`;
+    console.log(`[BF] ${reason2}. Finishing with ${missing} segments missing.`);
+    fetch("http://localhost:9876/brocoflix-done", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, ep_key: session.epKey }),
+    }).then(r => r.json()).then(result => {
+      console.log(`[BF] Forced mux result (${missing} segments missing): ${result.status} ${result.message || result.filename || ""}`);
+    }).catch(err => {
+      console.log(`[BF] Forced mux failed: ${err.message}`);
+    });
+    cleanupBrocoflixSession(sessionId);
+    triggerAutoCaptureEpisodeDone(tabId, sessionId);
+    return;
+  }
+
+  // Store reload state so we can resume when new m3u8 is intercepted
+  brocoflixReloadState.set(sessionId, {
+    tabId,
+    completedIndices,
+    totalSegments,
+    pageUrl: session.pageUrl,
+  });
+
+  // Cancel any previous reload timer
+  if (session._reloadTimer) clearTimeout(session._reloadTimer);
+  const reloadTimer = setTimeout(() => {
+    if (brocoflixReloadState.has(sessionId)) {
+      console.log(`[BF] Reload timeout for session ${sessionId} — no new m3u8 after 120s. Aborting.`);
+      brocoflixReloadState.delete(sessionId);
+      fetch("http://localhost:9876/brocoflix-abort", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      }).catch(() => {});
+      cleanupBrocoflixSession(sessionId);
+    }
+  }, 120000);
+  session._reloadTimer = reloadTimer;
+
+  // Allow the new m3u8 to be intercepted
+  seenM3u8.clear();
+
+  // Reload the embed iframe
+  chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const iframe = document.querySelector("iframe");
+      if (!iframe || !iframe.src) return "no_iframe";
+      let src = iframe.src;
+      src = src.replace("autoPlay=false", "autoPlay=true");
+      iframe.src = "";
+      setTimeout(() => { iframe.src = src; }, 500);
+      return "ok";
+    },
+  }).then(results => {
+    const r = results?.[0]?.result;
+    if (r === "ok") {
+      console.log(`[BF] Embed iframe reloaded. Will auto-click play button...`);
+      setTimeout(() => {
+        chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          world: "MAIN",
+          func: () => {
+            if (window === window.top) return null;
+            function tryClick() {
+              const selectors = [
+                "#btn-play", ".play-button", ".jw-icon-display", ".vjs-big-play-button",
+                "[aria-label='Play']", "button.player-btn", ".plyr__control--overlaid",
+                ".play-overlay", ".play_btn", "#play-btn",
+              ];
+              for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) { el.click(); return sel; }
+              }
+              const video = document.querySelector("video");
+              if (video) { video.click(); return "video"; }
+              return null;
+            }
+            let clicked = tryClick();
+            if (!clicked) {
+              let attempts = 0;
+              const timer = setInterval(() => {
+                clicked = tryClick();
+                attempts++;
+                if (clicked || attempts >= 10) clearInterval(timer);
+              }, 500);
+            }
+            return clicked;
+          },
+        }).catch(err => {
+          console.log(`[BF] Auto-play inject failed: ${err.message}`);
+        });
+      }, 3000);
+    } else {
+      console.log(`[BF] Iframe reload problem: ${r}. Falling back to full tab reload.`);
+      chrome.tabs.reload(tabId);
+    }
+  }).catch(err => {
+    console.log(`[BF] Iframe reload script failed: ${err.message}. Falling back to full tab reload.`);
+    chrome.tabs.reload(tabId);
+  });
+}
+
+// Finalize a completed download — mux and trigger auto-capture if needed
+async function finalizeBrocoflixDownload(sessionId) {
+  const session = brocoflixSessions.get(sessionId);
+  const epKey = session?.epKey || "";
+  const tabId = session?.tabId;
+
+  console.log(`[BF] All chunks received, requesting mux...`);
+
+  try {
+    const resp = await fetch("http://localhost:9876/brocoflix-done", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, ep_key: epKey }),
+    });
+    const result = await resp.json();
+    console.log(`[BF] Mux result: ${result.status} ${result.message || result.filename || ""}`);
+  } catch (err) {
+    console.log(`[BF] Mux request failed: ${err.message}`);
+  }
+
+  cleanupBrocoflixSession(sessionId);
+  triggerAutoCaptureEpisodeDone(tabId, sessionId);
+}
+
+// Trigger auto-capture done signal if applicable
+function triggerAutoCaptureEpisodeDone(tabId, sessionId) {
+  if (autoCapture.active && tabId === autoCapture.tabId && !autoCapture.episodeDoneSent) {
+    autoCapture.episodeDoneSent = true;
+    autoCapture.doneCount++;
+    updateBadge();
+    console.log(`[BF] Auto-capture done-signal for ep ${autoCapture.currentEp}`);
+    notifyTab(tabId, {
+      type: "autoCaptureEpisodeDone",
+      season: autoCapture.multiSeason ? autoCapture.currentSeason : autoCapture.season,
+      episode: autoCapture.currentEp,
+    });
+  }
+}
+
+// Fallback: inject the old MAIN-world downloader (used if SW fetch fails)
+function injectMainWorldDownloader(sessionId, m3u8Url, tabId, frameId, completedIndices) {
+  chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] },
+    world: "MAIN",
+    func: brocoflixDownloaderFunc,
+    args: [m3u8Url, sessionId, completedIndices || [], BROCOFLIX_RELOAD_THRESHOLD],
+  }).catch(err => {
+    console.log(`[BF] MAIN-world injection failed: ${err.message}`);
+  });
 }
 
 async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId, resumeOpts) {
@@ -651,15 +1195,13 @@ async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId, resumeOp
 
   const completedIndices = resumeOpts?.completedIndices || [];
 
-  // Inject the MAIN-world downloader into the embed iframe
-  chrome.scripting.executeScript({
-    target: { tabId, frameIds: [frameId] },
-    world: "MAIN",
-    func: brocoflixDownloaderFunc,
-    args: [m3u8Url, sessionId, completedIndices, BROCOFLIX_RELOAD_THRESHOLD],
-  }).catch(err => {
-    console.log(`[BF] Injection failed: ${err.message}`);
-    if (!resumeOpts) cleanupBrocoflixSession(sessionId);
+  // Use service worker download (FetchV-style) — fetches segments directly
+  // from the background, bypassing MAIN-world HTTP/2 socket pool poisoning.
+  // Falls back to MAIN-world injection if SW manifest fetch fails.
+  runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndices).catch(err => {
+    console.log(`[BF-sw] Download crashed: ${err.message}`);
+    console.log(`[BF-sw] Falling back to MAIN-world downloader`);
+    injectMainWorldDownloader(sessionId, m3u8Url, tabId, frameId, completedIndices);
   });
 }
 
@@ -1302,210 +1844,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true; // async response
   } else if (msg.type === "brocoflixDoneSignal") {
+    // MAIN-world fallback downloader reports all segments done
     const { sessionId } = msg;
-    const session = brocoflixSessions.get(sessionId);
-    const epKey = session?.epKey || "";
-
-    console.log(`[BF] All chunks received, requesting mux...`);
-
-    // Tell server to mux TS -> MP4
-    (async () => {
-      try {
-        const resp = await fetch("http://localhost:9876/brocoflix-done", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: sessionId, ep_key: epKey }),
-        });
-        const result = await resp.json();
-        console.log(`[BF] Mux result: ${result.status} ${result.message || result.filename || ""}`);
-      } catch (err) {
-        console.log(`[BF] Mux request failed: ${err.message}`);
-      }
-
-      cleanupBrocoflixSession(sessionId);
-
-      // If auto-capture is active for this tab, fire done-signal
-      const senderTabId = sender.tab?.id;
-      if (autoCapture.active && senderTabId === autoCapture.tabId && !autoCapture.episodeDoneSent) {
-        autoCapture.episodeDoneSent = true;
-        autoCapture.doneCount++;
-        updateBadge();
-        console.log(`[BF] Auto-capture done-signal for ep ${autoCapture.currentEp}`);
-        notifyTab(senderTabId, {
-          type: "autoCaptureEpisodeDone",
-          season: autoCapture.multiSeason ? autoCapture.currentSeason : autoCapture.season,
-          episode: autoCapture.currentEp,
-        });
-      }
-      sendResponse({ ok: true });
-    })();
-    return true; // async response
+    finalizeBrocoflixDownload(sessionId);
+    sendResponse({ ok: true });
   } else if (msg.type === "brocoflixNeedReload") {
-    // MAIN-world downloader hit a failure or proactive threshold — needs fresh connection pool.
-    // Reload the embed iframe to get a new CDN domain, then re-inject with the skip list.
+    // MAIN-world fallback downloader needs an iframe reload
     const { sessionId, completedIndices, totalSegments, reason } = msg;
-    const session = brocoflixSessions.get(sessionId);
-    if (!session) {
-      console.log(`[BF] Reload requested for unknown session ${sessionId}`);
-      sendResponse({ ok: false });
-      return;
-    }
-
-    const tabId = session.tabId;
-    const pageUrl = session.pageUrl;
-
-    // Track reload count and detect if we're stuck (no progress between reloads)
-    session.reloadCount = (session.reloadCount || 0) + 1;
-    const prevCompleted = session.lastCompletedCount || 0;
-    session.lastCompletedCount = completedIndices.length;
-    const madeProgress = completedIndices.length > prevCompleted;
-    const MAX_NO_PROGRESS_RELOADS = 3;
-    const MAX_TOTAL_RELOADS = 15; // hard limit to prevent infinite loops
-
-    if (!madeProgress) {
-      session.noProgressReloads = (session.noProgressReloads || 0) + 1;
-    } else {
-      session.noProgressReloads = 0;
-    }
-
-    const completionPct = (completedIndices.length / totalSegments * 100).toFixed(1);
-    const missing = totalSegments - completedIndices.length;
-    const TARGET_PCT = 99.5;
-    const meetsTarget = parseFloat(completionPct) >= TARGET_PCT;
-
-    console.log(`[BF] Iframe reload #${session.reloadCount} (${reason}): ${completedIndices.length}/${totalSegments} (${completionPct}%) done, ${missing} missing, target=${TARGET_PCT}%, progress=${madeProgress}, stalled=${session.noProgressReloads}/${MAX_NO_PROGRESS_RELOADS}`);
-
-    // Give up if:
-    // 1. Meets 99.5% target AND stalled — we're done, mux it
-    // 2. Below target but stalled for 5+ reloads — segments are permanently blocked by CDN
-    // 3. Hit hard reload limit
-    const shouldGiveUp = (meetsTarget && session.noProgressReloads >= MAX_NO_PROGRESS_RELOADS)
-      || session.noProgressReloads >= MAX_NO_PROGRESS_RELOADS + 2
-      || session.reloadCount >= MAX_TOTAL_RELOADS;
-    if (shouldGiveUp) {
-      const reason2 = session.reloadCount >= MAX_TOTAL_RELOADS
-        ? `Hit max ${MAX_TOTAL_RELOADS} reloads`
-        : meetsTarget
-          ? `Reached ${completionPct}% (>= ${TARGET_PCT}% target) and stalled`
-          : `Stalled at ${completionPct}% (${missing} segments permanently blocked by CDN) — best achievable`;
-      console.log(`[BF] ${reason2}. Finishing with ${missing} segments missing.`);
-      // Tell the MAIN-world we're done (skip missing segments)
-      // Post a done signal — the server will mux whatever chunks we sent
-      fetch("http://localhost:9876/brocoflix-done", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, ep_key: session.epKey }),
-      }).then(r => r.json()).then(result => {
-        console.log(`[BF] Forced mux result (${missing} segments missing): ${result.status} ${result.message || result.filename || ""}`);
-      }).catch(err => {
-        console.log(`[BF] Forced mux failed: ${err.message}`);
-      });
-      cleanupBrocoflixSession(sessionId);
-      sendResponse({ ok: true });
-      return;
-    }
-
-    // Store the reload state so we can resume when the new m3u8 is intercepted
-    brocoflixReloadState.set(sessionId, {
-      tabId,
-      completedIndices,
-      totalSegments,
-      pageUrl,
-    });
-
-    // Cancel any previous reload timer for this session before setting a new one.
-    // Without this, a timer from reload #N can fire during reload #N+1's retry pass
-    // (which takes ~90s for 9 segments × 10s) and abort the session prematurely.
-    const session2 = brocoflixSessions.get(sessionId);
-    if (session2?._reloadTimer) clearTimeout(session2._reloadTimer);
-    const reloadTimer = setTimeout(() => {
-      if (brocoflixReloadState.has(sessionId)) {
-        console.log(`[BF] Reload timeout for session ${sessionId} — no new m3u8 after 120s. Aborting.`);
-        brocoflixReloadState.delete(sessionId);
-        fetch("http://localhost:9876/brocoflix-abort", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: sessionId }),
-        }).catch(() => {});
-        cleanupBrocoflixSession(sessionId);
-      }
-    }, 120000);
-    if (session2) session2._reloadTimer = reloadTimer;
-
-    // Allow the new m3u8 to be intercepted (clear dedup)
-    seenM3u8.clear();
-
-    // Reload ONLY the embed iframe (not the whole page, which would lose the player).
-    // Clearing the iframe src and restoring it forces a fresh load with new CDN domain
-    // and a clean Chrome socket pool. Then auto-click the play button inside the iframe
-    // so the HLS player loads and fires the m3u8 request without manual intervention.
-    chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const iframe = document.querySelector("iframe");
-        if (!iframe || !iframe.src) return "no_iframe";
-        let src = iframe.src;
-        // Force autoPlay so the player starts without a manual click
-        src = src.replace("autoPlay=false", "autoPlay=true");
-        iframe.src = "";
-        // Small delay to ensure the old connection pool is torn down
-        setTimeout(() => { iframe.src = src; }, 500);
-        return "ok";
-      },
-    }).then(results => {
-      const r = results?.[0]?.result;
-      if (r === "ok") {
-        console.log(`[BF] Embed iframe reloaded. Will auto-click play button in iframe...`);
-        // Wait for iframe to load, then inject into ALL frames (allFrames: true)
-        // to avoid needing webNavigation permission. The injected function
-        // checks if it's in the right frame before clicking.
-        setTimeout(() => {
-          chrome.scripting.executeScript({
-            target: { tabId, allFrames: true },
-            world: "MAIN",
-            func: () => {
-              // Only act inside the embed iframe, not the top-level BrocoFlix page
-              if (window === window.top) return null;
-              function tryClick() {
-                const selectors = [
-                  "#btn-play", ".play-button", ".jw-icon-display", ".vjs-big-play-button",
-                  "[aria-label='Play']", "button.player-btn", ".plyr__control--overlaid",
-                  ".play-overlay", ".play_btn", "#play-btn",
-                ];
-                for (const sel of selectors) {
-                  const el = document.querySelector(sel);
-                  if (el) { el.click(); return sel; }
-                }
-                const video = document.querySelector("video");
-                if (video) { video.click(); return "video"; }
-                return null;
-              }
-              let clicked = tryClick();
-              if (!clicked) {
-                let attempts = 0;
-                const timer = setInterval(() => {
-                  clicked = tryClick();
-                  attempts++;
-                  if (clicked || attempts >= 10) clearInterval(timer);
-                }, 500);
-              }
-              return clicked;
-            },
-          }).then(results => {
-            const clicks = results?.filter(r => r.result).map(r => r.result);
-            console.log(`[BF] Auto-play click results: ${clicks.length ? clicks.join(", ") : "retrying via interval..."}`);
-          }).catch(err => {
-            console.log(`[BF] Auto-play inject failed: ${err.message}`);
-          });
-        }, 3000); // wait 3s for iframe to fully load
-      } else {
-        console.log(`[BF] Iframe reload problem: ${r}. Falling back to full tab reload.`);
-        chrome.tabs.reload(tabId);
-      }
-    }).catch(err => {
-      console.log(`[BF] Iframe reload script failed: ${err.message}. Falling back to full tab reload.`);
-      chrome.tabs.reload(tabId);
-    });
+    handleBrocoflixReload(sessionId, completedIndices, totalSegments, reason);
     sendResponse({ ok: true });
   } else if (msg.type === "brocoflixErrorSignal") {
     const { sessionId, error } = msg;
