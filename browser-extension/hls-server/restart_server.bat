@@ -19,7 +19,7 @@ for /f "tokens=5" %%p in ('netstat -aon ^| findstr ":9876.*LISTENING" 2^>nul') d
 timeout /t 1 /nobreak >nul
 
 echo Starting HLS Download Server (background, --apply)...
-start "" pythonw "C:\dev\thunderhead-scripts\browser-extension\hls-server\hls_download_server.py" --apply
+start "" pythonw "C:\dev\thunderhead\browser-extension\hls-server\hls_download_server.py" --apply
 
 echo Done. Server is running in background.
 echo Check log: python read_server_log.py
