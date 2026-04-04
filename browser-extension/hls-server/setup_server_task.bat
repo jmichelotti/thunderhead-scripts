@@ -3,7 +3,7 @@
 :: Registers the HLS Download Server to auto-start at logon.
 
 echo Registering HLS Download Server scheduled task...
-schtasks /create /tn "HLS Download Server" /tr "pythonw C:\dev\thunderhead-scripts\hls_download_server.py --apply" /sc onlogon /rl highest /f
+schtasks /create /tn "HLS Download Server" /tr "pythonw C:\dev\thunderhead-scripts\browser-extension\hls-server\hls_download_server.py --apply" /sc onlogon /rl highest /f
 
 if %errorlevel%==0 (
     echo.
