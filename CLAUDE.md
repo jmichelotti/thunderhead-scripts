@@ -16,7 +16,8 @@ thunderhead/
 │   ├── fix_file_names.py
 │   ├── fix_metadata_for_jellyfin.py
 │   ├── migrate_files.py
-│   └── download_youtube_jellyfin.py
+│   ├── download_youtube_jellyfin.py
+│   └── shift_subtitles.py
 ├── browser-extension/
 │   ├── hls-capture/   background.js, content.js, popup.html, popup.js, manifest.json
 │   └── hls-server/    hls_download_server.py, read_server_log.py, *.bat files

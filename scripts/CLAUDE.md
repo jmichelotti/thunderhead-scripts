@@ -11,6 +11,7 @@ Python utilities for renaming, fixing, migrating, and downloading media files fo
 - **`fix_metadata_for_jellyfin.py`** — Fixes files with problematic encoder tags ("hls.js", "dailymotion"). Tries QSV hardware encoding first (Intel Iris Xe), falls back to software x264. Handles MP4/MKV/AVI/MOV. Scans both `C:\Temp_Media\TV Shows` and `C:\Temp_Media\Movies`.
 - **`migrate_files.py`** — Moves processed media from `C:\Temp_Media\` to final library drives. TV routing: checks `D:\TV Shows` then `F:\TV Shows` for existing shows, new shows go to `L:\TV Shows`. Movies always go to `L:\Movies`. Handles file conflicts with `(migrated N)` suffix.
 - **`download_youtube_jellyfin.py`** — Downloads YouTube videos as `Title (Year).mp4`. Uses `--extractor-args youtube:player_client=android` workaround. Output: `C:\Temp_Media\YouTube`.
+- **`shift_subtitles.py`** — Shifts .srt subtitle timestamps by a given number of seconds. Accepts a file path directly or `--scan` to find .srt files in staging dirs. Positive values shift forward, negative shift backward. Timestamps floor at `00:00:00,000`.
 
 ## Conventions
 

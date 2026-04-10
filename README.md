@@ -10,6 +10,7 @@ Personal tooling for managing and maintaining my **ThunderheadFlix** Jellyfin me
 - **`fix_tv_names.py`** / **`fix_movie_names.py`** — Rename media files using OMDb lookups
 - **`migrate_files.py`** — Move processed media from staging to library drives
 - **`download_youtube_jellyfin.py`** — Download YouTube videos via yt-dlp
+- **`shift_subtitles.py`** — Shift .srt subtitle timestamps forward or backward
 
 ## Browser Extension (`browser-extension/`)
 
