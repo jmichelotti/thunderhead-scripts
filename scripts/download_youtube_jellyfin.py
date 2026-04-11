@@ -10,9 +10,7 @@ def download_for_jellyfin(url: str):
     cmd = [
         "yt-dlp",
 
-        "--extractor-args", "youtube:player_client=android",
-
-        "-f", "bv*[height<=1080][ext=mp4]/bv*[height<=1080]/b",
+        "-f", "bv*[height<=1080][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=1080][ext=mp4]+ba/b[height<=1080]",
 
         "--merge-output-format", "mp4",
         "--postprocessor-args", "ffmpeg:-movflags +faststart",
