@@ -69,15 +69,14 @@ def get_stream_codecs(ffinfo: dict):
 
 def needs_fix(ffinfo: dict) -> bool:
     fmt = ffinfo.get("format", {})
-    tags = fmt.get("tags", {}) or {}
-    enc = (tags.get("encoder") or "").lower()
+    fmt_tags = fmt.get("tags", {}) or {}
+    fmt_enc = (fmt_tags.get("encoder") or "").lower()
 
-    if enc.startswith("lavf"):
-        return False
-
-    if any(p in enc for p in ENCODER_PATTERNS):
+    if any(p in fmt_enc for p in ENCODER_PATTERNS):
         return True
 
+    # Stream-level tags persist through -c copy remux, so check them
+    # even when format.encoder is lavf from a prior remux.
     for s in ffinfo.get("streams", []):
         tags = s.get("tags", {}) or {}
         enc = (tags.get("encoder") or "").lower()
@@ -99,6 +98,8 @@ def remux_to_mp4(src: Path, dest: Path, dry_run: bool):
         "-i", str(src),
         "-map", "0",
         "-c", "copy",
+        "-metadata:s:v", "encoder=",
+        "-metadata:s:a", "encoder=",
         "-movflags", "+faststart",
         str(dest),
     ]
@@ -235,15 +236,23 @@ def main():
         description="Fix video files for Jellyfin (QSV hardware encoding, multi-container)."
     )
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Override scan roots (repeatable). Example: --root \"D:\\TV Shows\" --root \"D:\\Movies\"",
+    )
     args = parser.parse_args()
 
     dry_run = not args.apply
+    roots = args.root if args.root else FOLDERS_TO_SCAN
 
     print("=== Jellyfin Video Fixer (QSV + multi-container) ===")
     print(f"DRY_RUN={dry_run}")
+    print(f"Roots:   {list(roots)}")
     print("===================================================\n")
 
-    for root in map(Path, FOLDERS_TO_SCAN):
+    for root in map(Path, roots):
         if not root.exists():
             print(f"[WARN] Missing path: {root}")
             continue
