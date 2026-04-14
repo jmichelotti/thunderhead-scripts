@@ -2,6 +2,10 @@
 """
 audit_jellyfin.py - Audit Jellyfin media libraries for corruption and layout issues.
 
+READ-ONLY with respect to media files. This script never creates, modifies,
+renames, or deletes any file under the TV or Movie roots. All writes are confined
+to scripts/audit_reports/ (CSV report, summary, decode cache, lock file).
+
 Tiers:
   1 (fast, default)  - ffprobe structural checks (streams, duration, codecs, encoder tag, container)
   2 (fast, default)  - naming/layout checks against canonical Show (Year)/Season NN/ and Title (Year)/ conventions
@@ -12,6 +16,7 @@ Run:
   python audit_jellyfin.py --deep           # + tier 3 decode sweep
   python audit_jellyfin.py --drive D        # limit to one or more drives
   python audit_jellyfin.py --limit 50       # cap files per root (testing)
+  python audit_jellyfin.py --cpu-limit 25   # cap tier-3 ffmpeg to 25% total CPU (Win8.1+)
   python audit_jellyfin.py --clear-cache    # wipe the deep-decode cache
 
 Outputs land in scripts/audit_reports/:
@@ -19,6 +24,7 @@ Outputs land in scripts/audit_reports/:
   latest.csv             copy of most recent report (stable path for scheduler)
   latest_summary.txt     human-readable counts
   .deep_cache.json       tier-3 cache (never commit)
+  .audit.lock            PID lock (duplicate-instance guard)
 """
 
 from pathlib import Path
@@ -26,8 +32,11 @@ from datetime import datetime
 from collections import Counter
 import argparse
 import csv
+import ctypes
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 
@@ -77,6 +86,7 @@ SANE_MAX_DURATION_SEC = 12 * 3600
 
 REPORTS_DIR = Path(__file__).parent / "audit_reports"
 CACHE_FILE = REPORTS_DIR / ".deep_cache.json"
+LOCK_FILE = REPORTS_DIR / ".audit.lock"
 
 FIELDNAMES = ["drive", "path", "tier", "severity", "issue", "detail", "mtime"]
 
@@ -294,6 +304,73 @@ def scan_orphans_and_empty_dirs(root: Path, drive: str):
 
 
 # ============================================================
+# Windows Job Object - CPU rate control
+# ============================================================
+# Caps tier-3 ffmpeg CPU usage to a configurable percent of total system CPU.
+# Unlike "-threads 1" (which pins one core hot), a Job Object hard-cap lets
+# ffmpeg spread its work across all cores at a low duty cycle per core, so
+# no single core stays hot enough to trigger sustained fan spin.
+# Requires Windows 8.1+ for the hard-cap flag. Read-only: only throttles CPU.
+
+_JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION_CLASS = 15
+_JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
+_JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+_CREATE_NO_WINDOW = 0x08000000
+
+
+class _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("ControlFlags", ctypes.c_uint32),
+        ("CpuRate", ctypes.c_uint32),
+    ]
+
+
+def _create_cpu_rate_job(cpu_percent: int):
+    if sys.platform != "win32":
+        return None
+    k32 = ctypes.windll.kernel32
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError()
+    info = _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+    info.ControlFlags = (
+        _JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | _JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
+    )
+    info.CpuRate = int(cpu_percent) * 100  # units are 1/100 of a percent
+    ok = k32.SetInformationJobObject(
+        job,
+        _JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION_CLASS,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if not ok:
+        k32.CloseHandle(job)
+        raise ctypes.WinError()
+    return job
+
+
+def _assign_pid_to_job(job, pid: int) -> bool:
+    if sys.platform != "win32" or not job:
+        return False
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+    if not h:
+        return False
+    try:
+        return bool(k32.AssignProcessToJobObject(job, h))
+    finally:
+        k32.CloseHandle(h)
+
+
+def _close_job(job):
+    if sys.platform != "win32" or not job:
+        return
+    ctypes.windll.kernel32.CloseHandle(job)
+
+
+# ============================================================
 # Tier 3 - decode sweep (cache-gated)
 # ============================================================
 
@@ -312,7 +389,63 @@ def save_cache(cache):
     CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
-def check_tier3(path: Path, drive: str, mtime_str: str, cache: dict):
+# The only shape of ffmpeg output we permit: null muxer writing to stdout.
+# This guarantees ffmpeg cannot write to any media file. Enforced at runtime.
+_FFMPEG_SAFE_OUTPUT_TAIL = ("-f", "null", "-")
+_FFMPEG_UNSAFE_FLAGS = {"-y", "-n"}  # overwrite/no-overwrite only matter if writing
+
+
+def _assert_readonly_ffmpeg_cmd(cmd):
+    if tuple(cmd[-3:]) != _FFMPEG_SAFE_OUTPUT_TAIL:
+        raise RuntimeError(
+            f"tier3 ffmpeg cmd must end with {_FFMPEG_SAFE_OUTPUT_TAIL}; got tail {cmd[-3:]}"
+        )
+    for flag in _FFMPEG_UNSAFE_FLAGS:
+        if flag in cmd:
+            raise RuntimeError(f"tier3 ffmpeg cmd contains write-signalling flag {flag!r}: {cmd}")
+
+
+def _run_ffmpeg(cmd, timeout, cpu_limit):
+    """Run ffmpeg with stderr captured. If cpu_limit is set (Windows only),
+    run under a Job Object with a hard CPU rate cap.
+    Returns (returncode, stderr_text). Raises TimeoutExpired on timeout."""
+    creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+    if cpu_limit <= 0 or cpu_limit >= 100 or sys.platform != "win32":
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+            creationflags=creationflags,
+        )
+        return result.returncode, result.stderr
+
+    job = _create_cpu_rate_job(cpu_limit)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=creationflags,
+        )
+        # Assign to job immediately. The race window before assignment is at
+        # most a few ms of CPU, which is negligible against multi-minute decodes.
+        _assign_pid_to_job(job, proc.pid)
+        try:
+            _, stderr = proc.communicate(timeout=timeout)
+            return proc.returncode, stderr
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+    finally:
+        _close_job(job)
+
+
+def check_tier3(path: Path, drive: str, mtime_str: str, cache: dict, cpu_limit: int = 0):
     key = str(path)
     try:
         st = path.stat()
@@ -326,25 +459,31 @@ def check_tier3(path: Path, drive: str, mtime_str: str, cache: dict):
         return [make_issue(path, drive, "tier3", "error", "decode_error",
                            f"{cached.get('detail', '')} (cached)", mtime_str)]
 
-    cmd = [
-        "ffmpeg", "-v", "error", "-xerror",
+    size_mb = st.st_size / (1024 * 1024)
+    print(f"[tier3] Decoding: {path.name} ({size_mb:.0f} MB)", flush=True)
+
+    # Build command. With CPU rate control we let ffmpeg auto-thread so work
+    # spreads across cores at low duty cycle per core (keeps the fan quiet).
+    # Without rate control we pin -threads 1 to avoid saturating the machine.
+    cmd = ["ffmpeg", "-v", "error", "-xerror"]
+    if cpu_limit <= 0:
+        cmd += ["-threads", "1"]
+    cmd += [
         "-nostdin", "-hide_banner",
         "-i", str(path),
         "-map", "0:v:0?", "-map", "0:a?",
         "-f", "null", "-",
     ]
+    _assert_readonly_ffmpeg_cmd(cmd)
+
+    pre_size, pre_mtime = st.st_size, st.st_mtime
+
     issues = []
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=3 * 3600,
-        )
-        stderr = (result.stderr or "").strip()
-        if result.returncode != 0 or stderr:
-            tail = stderr.splitlines()[-1] if stderr else f"rc={result.returncode}"
+        rc, stderr = _run_ffmpeg(cmd, timeout=3 * 3600, cpu_limit=cpu_limit)
+        stderr = (stderr or "").strip()
+        if rc != 0 or stderr:
+            tail = stderr.splitlines()[-1] if stderr else f"rc={rc}"
             detail = tail[:500]
             issues.append(make_issue(path, drive, "tier3", "error", "decode_error", detail, mtime_str))
             cache[key] = {
@@ -360,9 +499,25 @@ def check_tier3(path: Path, drive: str, mtime_str: str, cache: dict):
             }
     except subprocess.TimeoutExpired:
         issues.append(make_issue(path, drive, "tier3", "error", "decode_timeout", "", mtime_str))
+        return issues
     except FileNotFoundError:
         print("[FATAL] ffmpeg not found on PATH", file=sys.stderr)
         sys.exit(2)
+
+    # Integrity check: ffmpeg with "-f null -" must never touch the input.
+    # If size or mtime changed, flag it — could be a bug here or a concurrent
+    # writer (Jellyfin scan, etc.). Either way the user wants to know.
+    try:
+        post = path.stat()
+        if post.st_size != pre_size or post.st_mtime != pre_mtime:
+            issues.append(make_issue(
+                path, drive, "tier3", "warn", "file_modified_during_decode",
+                f"size {pre_size}->{post.st_size}, mtime {pre_mtime}->{post.st_mtime}",
+                mtime_str,
+            ))
+    except OSError:
+        pass
+
     return issues
 
 
@@ -377,6 +532,68 @@ def walk_videos(root: Path):
     for p in root.rglob("*"):
         if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
             yield p
+
+
+# ============================================================
+# Duplicate-instance guard (PID lockfile)
+# ============================================================
+
+
+def _is_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        exit_code = ctypes.c_uint32(0)
+        if not k32.GetExitCodeProcess(h, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
+def acquire_lock() -> bool:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    if LOCK_FILE.exists():
+        try:
+            other_pid = int(LOCK_FILE.read_text(encoding="utf-8").strip() or "0")
+        except (ValueError, OSError):
+            other_pid = 0
+        if other_pid and _is_process_alive(other_pid):
+            print(
+                f"[ABORT] Another audit is already running (pid {other_pid}). "
+                f"Lock: {LOCK_FILE}",
+                file=sys.stderr,
+            )
+            return False
+        print(f"[lock] Removing stale lock (pid {other_pid} not alive): {LOCK_FILE}")
+        try:
+            LOCK_FILE.unlink()
+        except OSError:
+            pass
+    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
+def release_lock():
+    try:
+        if LOCK_FILE.exists():
+            pid_in_file = LOCK_FILE.read_text(encoding="utf-8").strip()
+            if pid_in_file == str(os.getpid()):
+                LOCK_FILE.unlink()
+    except OSError:
+        pass
 
 
 # ============================================================
@@ -399,6 +616,9 @@ def main():
                     help="Process at most N videos per root (testing).")
     ap.add_argument("--clear-cache", action="store_true",
                     help="Clear deep-decode cache and exit.")
+    ap.add_argument("--cpu-limit", type=int, default=0,
+                    help="Cap tier-3 ffmpeg to N%% total CPU via Windows Job Object "
+                         "(Win8.1+). 0 = no cap (use -threads 1 instead). Recommended: 25.")
     args = ap.parse_args()
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -411,6 +631,36 @@ def main():
             print("No cache to clear.")
         return
 
+    if args.cpu_limit < 0 or args.cpu_limit >= 100:
+        print(f"[FATAL] --cpu-limit must be 0..99, got {args.cpu_limit}", file=sys.stderr)
+        sys.exit(2)
+    if args.cpu_limit > 0 and sys.platform != "win32":
+        print("[WARN] --cpu-limit is Windows-only; ignoring.", file=sys.stderr)
+        args.cpu_limit = 0
+
+    if not acquire_lock():
+        sys.exit(3)
+
+    def _cleanup_and_exit(signum, frame):
+        release_lock()
+        sys.exit(130)
+
+    try:
+        signal.signal(signal.SIGINT, _cleanup_and_exit)
+    except (ValueError, AttributeError):
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _cleanup_and_exit)
+    except (ValueError, AttributeError):
+        pass
+
+    try:
+        _run_audit(args)
+    finally:
+        release_lock()
+
+
+def _run_audit(args):
     drive_filter = {d.upper().rstrip(":") for d in args.drive} if args.drive else None
 
     def _filter(root_list):
@@ -426,7 +676,13 @@ def main():
 
     print("=== Jellyfin Audit ===")
     print(f"Started:      {datetime.now().isoformat(timespec='seconds')}")
+    print(f"PID:          {os.getpid()}")
     print(f"Deep mode:    {args.deep}")
+    if args.deep:
+        if args.cpu_limit > 0:
+            print(f"CPU cap:      {args.cpu_limit}% (Job Object, threads auto)")
+        else:
+            print(f"CPU cap:      none (-threads 1)")
     print(f"TV roots:     {[str(r) for r, _ in tv_roots]}")
     print(f"Movie roots:  {[str(r) for r, _ in movie_roots]}")
     print("======================\n")
@@ -434,9 +690,25 @@ def main():
     all_issues = []
     cache = load_cache() if args.deep else {}
     files_scanned = 0
+    deep_since_save = 0
+    start_time = datetime.now()
+
+    # Count total files up front for progress reporting
+    total_files = 0
+    all_roots = [(r, d, "tv") for r, d in tv_roots] + [(r, d, "movie") for r, d in movie_roots]
+    for root, _, _ in all_roots:
+        if root.exists():
+            total_files += sum(1 for _ in walk_videos(root))
+    print(f"Total video files: {total_files}", flush=True)
+
+    def _elapsed():
+        delta = datetime.now() - start_time
+        h, rem = divmod(int(delta.total_seconds()), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
     def _process(video: Path, drive: str, kind: str, root: Path):
-        nonlocal files_scanned
+        nonlocal files_scanned, deep_since_save
         files_scanned += 1
         try:
             st = video.stat()
@@ -450,10 +722,15 @@ def main():
         else:
             all_issues.extend(check_tier2_movie(video, drive, mtime_str, root))
         if args.deep:
-            all_issues.extend(check_tier3(video, drive, mtime_str, cache))
+            all_issues.extend(check_tier3(video, drive, mtime_str, cache, args.cpu_limit))
+            deep_since_save += 1
+            if deep_since_save >= 1:
+                save_cache(cache)
+                deep_since_save = 0
 
-        if files_scanned % 100 == 0:
-            print(f"[progress] {files_scanned} files scanned, {len(all_issues)} issues", flush=True)
+        if files_scanned % 50 == 0:
+            pct = files_scanned / total_files * 100 if total_files else 0
+            print(f"[progress] {files_scanned} / {total_files} ({pct:.1f}%) — {len(all_issues)} issues — elapsed {_elapsed()}", flush=True)
 
     for root, drive in tv_roots:
         if not root.exists():
