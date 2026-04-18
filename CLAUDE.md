@@ -31,7 +31,9 @@ thunderhead/
 │   ├── jellyfin_client.py     async Jellyfin API wrapper
 │   ├── tvmaze_client.py       async TVmaze API wrapper (no auth needed)
 │   ├── episode_gaps.py        detect missing episodes via TVmaze comparison
-│   ├── config.py              server URL, API key, host/port
+│   ├── config.py              server URL, API key, host/port (all env-overridable)
+│   ├── Dockerfile             Python 3.12-slim container for the analytics service
+│   ├── docker-compose.yml     container config: port 1201, restart unless-stopped
 │   ├── tracked_shows.json     cached show→TVmaze ID mappings (gitignored)
 │   └── requirements.txt       fastapi, uvicorn, httpx
 ├── wrapped/
@@ -56,7 +58,7 @@ thunderhead/
 - **HLS temp**: `C:\Temp_Media\_hls_tmp\`
 
 - **Jellyfin server**: `http://localhost:8096`, API key `388076d3d5c84671b9602ae56f73ac34` (named "thunderhead-analytics")
-- **Analytics service**: `http://127.0.0.1:1201`, frontend at `/wrapped/`
+- **Analytics service**: `http://127.0.0.1:1201`, frontend at `/wrapped/` — runs in Docker container `thunderhead-analytics` (`docker compose up -d` from `analytics/`)
 - **Playback Reporting DB**: `C:\ProgramData\Jellyfin\Server\data\playback_reporting.db` (plugin-managed, data since 2026-02-17)
 
 Hardcoded paths throughout the repo are intentional (personal machine config). Don't refactor them into shared config unless asked.

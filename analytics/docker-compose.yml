@@ -1,0 +1,16 @@
+services:
+  analytics:
+    build: .
+    container_name: thunderhead-analytics
+    ports:
+      - "1201:1201"
+    environment:
+      - JELLYFIN_URL=http://host.docker.internal:8096
+      - JELLYFIN_API_KEY=388076d3d5c84671b9602ae56f73ac34
+      - HOST=0.0.0.0
+    volumes:
+      - ../wrapped:/wrapped:ro
+      - ./tracked_shows.json:/app/tracked_shows.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
