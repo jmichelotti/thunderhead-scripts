@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0c0a0e">
+  <title>ThunderheadFlix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,300..700;1,9..40,300..700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="grain"></div>
+  <header>
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-mark">TF</span>
+        <span class="logo-text">ThunderheadFlix</span>
+      </div>
+      <nav id="nav">
+        <button class="nav-btn active" data-view="wrapped">Wrapped</button>
+        <button class="nav-btn" data-view="now-watching">Watching</button>
+        <button class="nav-btn" data-view="library">Library</button>
+      </nav>
+      <div id="server-badge" class="badge offline">
+        <span class="badge-dot"></span>
+        <span class="badge-text">offline</span>
+      </div>
+    </div>
+  </header>
+
+  <main id="app">
+    <div class="loading-wrap">
+      <div class="loading-spinner"></div>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

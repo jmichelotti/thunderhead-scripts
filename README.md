@@ -20,4 +20,29 @@ Two-part system for capturing and downloading HLS streams:
 - **`hls-capture/`** — Chrome/Vivaldi Manifest V3 extension that intercepts m3u8 URLs with auto-capture support
 - **`hls-server/`** — Local Python server (port 9876) that downloads captured streams with Jellyfin-friendly naming
 
+## Analytics (`analytics/`)
+
+FastAPI service (port 1201) exposing Jellyfin server stats via REST API:
+
+- **`/status`** — Server health, active streams, library counts, storage, users (all-in-one)
+- **`/sessions`** — Who's watching what, playback progress, device, transcode details
+- **`/library`** — Movie/series/episode counts, per-drive storage usage
+- **`/playback/wrapped`** — Per-user viewing summary (top shows, movies, total time)
+- **`/playback/currently-watching`** — Shows each user is actively watching with last episode
+- **`/playback/most-watched`** — Most watched shows and movies across all users
+- **`/playback/breakdowns`** — Usage breakdown by user, device, client, playback method
+- **`/playback/hourly`** — Viewing heatmap by day of week and hour
+- **`/playback/history/{username}`** — Per-user event-level playback log
+- **`/playback/activity`** — Daily play counts and watch time per user
+
+Requires the **Playback Reporting** plugin on Jellyfin. Run with `cd analytics && python app.py`.
+
+## Wrapped Frontend (`wrapped/`)
+
+Static HTML/CSS/JS dashboard served by the analytics service at `/wrapped/`. Three views:
+
+- **Wrapped** — Per-user stats cards, viewing heatmap, now-playing banner
+- **Watching** — What shows each user is currently watching with episode details
+- **Library** — Media counts, storage bars per drive, user table
+
 This repo is primarily designed for my local media structure and workflows.

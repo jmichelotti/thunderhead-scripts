@@ -1,9 +1,11 @@
 # Thunderhead
 
-Personal tooling for managing a Jellyfin media server ("ThunderheadFlix"). Two main subsystems:
+Personal tooling for managing a Jellyfin media server ("ThunderheadFlix"). Four subsystems:
 
 - **`scripts/`** — Python utilities for renaming, fixing metadata, migrating, and downloading media
 - **`browser-extension/`** — Chrome/Vivaldi extension + local Python server for capturing and downloading HLS streams
+- **`analytics/`** — FastAPI service (port 1201) exposing Jellyfin stats: live sessions, library counts, storage, and playback history via the Playback Reporting plugin
+- **`wrapped/`** — Static frontend served by the analytics service at `/wrapped/`, showing per-user viewing stats, currently-watching shows, and library overview
 
 ## Repo Structure
 
@@ -24,6 +26,15 @@ thunderhead/
 ├── browser-extension/
 │   ├── hls-capture/   background.js, content.js, popup.html, popup.js, manifest.json
 │   └── hls-server/    hls_download_server.py, read_server_log.py, *.bat files
+├── analytics/
+│   ├── app.py                 FastAPI server (port 1201), all endpoints
+│   ├── jellyfin_client.py     async Jellyfin API wrapper
+│   ├── config.py              server URL, API key, host/port
+│   └── requirements.txt       fastapi, uvicorn, httpx
+├── wrapped/
+│   ├── index.html             dashboard shell (3 views: Wrapped, Watching, Library)
+│   ├── styles.css             cinematic dark theme
+│   └── app.js                 vanilla JS SPA fetching from analytics API
 └── README.md
 ```
 
@@ -33,12 +44,16 @@ thunderhead/
 - OMDb API key `591dfd18` is used across multiple scripts and the server for metadata lookups.
 - `sanitize_for_windows()` is duplicated in several files — this is intentional, not a refactor target.
 - External tools required: **ffmpeg/ffprobe**, **yt-dlp**.
-- Python 3.10+. Only pip dependencies are `requests` and optionally `langdetect`.
+- Python 3.10+. Scripts need `requests` (and optionally `langdetect`). Analytics needs `fastapi`, `uvicorn`, `httpx`.
 
 ## Key Paths
 
 - **Staging area**: `C:\Temp_Media\` (TV Shows, Movies subdirs) — where scripts pick up and process files
 - **Final libraries**: `D:\TV Shows`, `F:\TV Shows`, `L:\TV Shows`, `D:\Movies`, `F:\Movies`, `L:\Movies`
 - **HLS temp**: `C:\Temp_Media\_hls_tmp\`
+
+- **Jellyfin server**: `http://localhost:8096`, API key `388076d3d5c84671b9602ae56f73ac34` (named "thunderhead-analytics")
+- **Analytics service**: `http://127.0.0.1:1201`, frontend at `/wrapped/`
+- **Playback Reporting DB**: `C:\ProgramData\Jellyfin\Server\data\playback_reporting.db` (plugin-managed, data since 2026-02-17)
 
 Hardcoded paths throughout the repo are intentional (personal machine config). Don't refactor them into shared config unless asked.
