@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+import episode_gaps
 import jellyfin_client as jf
 
 log = logging.getLogger("analytics")
@@ -276,6 +277,7 @@ def root() -> dict:
             "/playback/wrapped?days=365",
             "/playback/history/{username}?days=365",
             "/playback/currently-watching?days=30",
+            "/episodes/gaps?days=30",
         ]
     }
 
@@ -585,6 +587,18 @@ async def currently_watching(days: int = 30) -> dict:
     # Sort users by most recently active
     result.sort(key=lambda x: x["shows"][0]["last_watched"] if x["shows"] else "", reverse=True)
     return {"days": days, "users": result}
+
+
+@app.get("/episodes/gaps")
+async def episodes_gaps(days: int = 30, all_seasons: bool = False) -> dict:
+    gaps = await episode_gaps.scan_gaps(days, recent_only=not all_seasons)
+    total_missing = sum(len(g["missing_episodes"]) for g in gaps)
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "shows_with_gaps": len(gaps),
+        "total_missing_episodes": total_missing,
+        "gaps": gaps,
+    }
 
 
 if __name__ == "__main__":

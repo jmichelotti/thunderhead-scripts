@@ -29,7 +29,10 @@ thunderhead/
 ├── analytics/
 │   ├── app.py                 FastAPI server (port 1201), all endpoints
 │   ├── jellyfin_client.py     async Jellyfin API wrapper
+│   ├── tvmaze_client.py       async TVmaze API wrapper (no auth needed)
+│   ├── episode_gaps.py        detect missing episodes via TVmaze comparison
 │   ├── config.py              server URL, API key, host/port
+│   ├── tracked_shows.json     cached show→TVmaze ID mappings (gitignored)
 │   └── requirements.txt       fastapi, uvicorn, httpx
 ├── wrapped/
 │   ├── index.html             dashboard shell (3 views: Wrapped, Watching, Library)

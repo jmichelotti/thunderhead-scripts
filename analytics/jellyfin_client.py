@@ -61,6 +61,29 @@ async def library_folders() -> list[dict]:
     return await _get("/Library/VirtualFolders")
 
 
+# ── Series / Episodes ────────────────────────────────────────────────
+
+async def series_list() -> list[dict]:
+    data = await _get(
+        "/Items",
+        {
+            "includeItemTypes": "Series",
+            "recursive": "true",
+            "fields": "ProviderIds,Status,RecursiveItemCount",
+            "limit": "500",
+        },
+    )
+    return data.get("Items", [])
+
+
+async def series_episodes(series_id: str) -> list[dict]:
+    data = await _get(
+        f"/Shows/{series_id}/Episodes",
+        {"fields": "PremiereDate,ProviderIds"},
+    )
+    return data.get("Items", [])
+
+
 # ── Users ────────────────────────────────────────────────────────────
 
 async def users() -> list[dict]:

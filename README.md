@@ -35,6 +35,8 @@ FastAPI service (port 1201) exposing Jellyfin server stats via REST API:
 - **`/playback/history/{username}`** — Per-user event-level playback log
 - **`/playback/activity`** — Daily play counts and watch time per user
 
+- **`/episodes/gaps`** — Detect missing episodes for currently-airing shows users are watching (compares Jellyfin library against TVmaze air dates)
+
 Requires the **Playback Reporting** plugin on Jellyfin. Run with `cd analytics && python app.py`.
 
 ## Wrapped Frontend (`wrapped/`)
