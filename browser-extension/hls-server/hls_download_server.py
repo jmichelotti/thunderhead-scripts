@@ -244,8 +244,11 @@ def parse_episode_info(body: dict, page_url: str) -> dict:
     # Fall back to URL parsing (1movies.bz slug format)
     url_info = parse_show_from_url(page_url)
     is_movie = url_info.get("is_movie", False) or "type=movie" in page_url
+    slug = url_info.get("show_slug", "")
+    if not slug and show_name:
+        slug = re.sub(r"[^a-z0-9]+", "-", show_name.lower()).strip("-")
     return {
-        "show_slug": url_info.get("show_slug", ""),
+        "show_slug": slug,
         "show_name": show_name or url_info.get("show_name", ""),
         "season":    season  if season  is not None else url_info.get("season"),
         "episode":   episode if episode is not None else url_info.get("episode"),
@@ -740,7 +743,10 @@ def brocoflix_start(body: dict) -> dict:
         output_path = OUTPUT_DIR / filename
 
     show_slug = info.get("show_slug", "")
-    ep_key = f"{show_slug}|{season or 0}|{episode or 0}"
+    if is_movie or (season is None and episode is None):
+        ep_key = f"{show_slug}|movie"
+    else:
+        ep_key = f"{show_slug}|{season or 0}|{episode or 0}"
 
     # Deduplicate
     with HLSHandler._lock:
