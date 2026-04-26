@@ -15,10 +15,24 @@ Safe by default: DRY RUN unless you pass --apply.
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Optional, Dict
 
 import requests
+
+
+def _move_with_retry(src: str, dst: str, retries: int = 5, delay: float = 2.0) -> None:
+    for attempt in range(retries):
+        try:
+            shutil.move(src, dst)
+            return
+        except PermissionError:
+            if attempt < retries - 1:
+                print(f"  [LOCKED] Retrying in {delay}s… ({attempt + 1}/{retries})")
+                time.sleep(delay)
+            else:
+                raise
 
 
 # ======== CONFIG ========
@@ -364,7 +378,7 @@ def process_movies(movies_root: Path, dry_run: bool = True) -> None:
             print(f"  WARNING: Target video already exists, skipping move: {target_video}")
         else:
             print(f"  Moving video -> {target_video}")
-            shutil.move(str(item), str(target_video))
+            _move_with_retry(str(item), str(target_video))
 
         # Move subtitles
         for sub in matching_subs:
@@ -374,7 +388,7 @@ def process_movies(movies_root: Path, dry_run: bool = True) -> None:
                 print(f"  WARNING: Target subtitle already exists, skipping: {target_sub}")
                 continue
             print(f"  Moving subtitle -> {target_sub}")
-            shutil.move(str(sub), str(target_sub))
+            _move_with_retry(str(sub), str(target_sub))
 
 # ======== CLI ENTRYPOINT ========
 
