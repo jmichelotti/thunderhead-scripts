@@ -81,14 +81,15 @@ Key design decisions:
 
 ## BrocoFlix Special Handling
 
-CDN blocks all non-browser clients (403). Current approach (Phase 3):
+CDN blocks all non-browser clients (403). Current approach (Phase 3.2 — 100% segment completion):
 - `runBrocoflixSwDownload()` fetches segments from background.js service worker
 - `declarativeNetRequest` spoofs Origin/Referer headers at network stack level
+- `onSendHeaders` with `"extraHeaders"` captures full browser header set including cookies/Sec-* headers
 - Direct binary POST to server upload endpoints (no base64 overhead)
 - Separate socket pool eliminates HTTP/2 GOAWAY issues
-- Proactive reload disabled (`BROCOFLIX_RELOAD_THRESHOLD = 0`) — CDN no longer triggers GOAWAY
-- If >=99.5% segments complete and retries stall, muxes with gaps rather than aborting
-- MAIN-world catch routes errors through reload handler (not immediate abort) when segments exist
+- Per-segment 429 backoff: on HTTP 429, retries up to 5× with exponential backoff (5s, 10s, 20s, 40s, 80s)
+- Sequential fetching only — concurrent workers trigger aggressive CDN rate limiting
+- If all retries exhausted, falls back to page reload (but 429 backoff typically recovers every segment)
 
 See memory file `brocoflix-download-attempts.md` for full approach history and what's been tried.
 

@@ -106,7 +106,7 @@ chrome.webRequest.onSendHeaders.addListener(
     capturedCdnHeaders.set(details.tabId, { headers, origin, referer, capturedAt: Date.now() });
   },
   { urls: ["<all_urls>"] },
-  ["requestHeaders"]
+  ["requestHeaders", "extraHeaders"]
 );
 
 // ========= declarativeNetRequest: spoof Origin/Referer for CDN requests =========
@@ -808,16 +808,12 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
 
   const totalSegs = segments.length;
   const remaining = totalSegs - alreadyDone.size;
-  const isRetryPass = remaining <= 20 && alreadyDone.size > 0;
-  // No throttle for main pass — FetchV proves CDN accepts rapid requests from
-  // a trusted origin. Retry pass uses short delay to space out retries.
-  const THROTTLE_MS = isRetryPass ? 3000 : 0;
-  const MAX_CONSECUTIVE_FAILS = isRetryPass ? remaining + 1 : 10;
+  const MAX_429_RETRIES = 5;
+  const INITIAL_BACKOFF_MS = 5000;
 
-  console.log(`[BF-sw] ${totalSegs} segments, ${alreadyDone.size} done, ${remaining} remaining${isRetryPass ? ` (RETRY PASS: ${THROTTLE_MS / 1000}s between fetches)` : ""}`);
+  console.log(`[BF-sw] ${totalSegs} segments, ${alreadyDone.size} done, ${remaining} remaining`);
 
   let segsFetchedThisCycle = 0;
-  let consecutiveFails = 0;
   const failedThisCycle = [];
   const allCompleted = new Set(alreadyDone);
 
@@ -830,8 +826,8 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
   async function flushToServer() {
     while (sendCursor < totalSegs) {
       if (alreadyDone.has(sendCursor)) { sendCursor++; continue; }
-      if (downloaded[sendCursor] === false) { sendCursor++; continue; } // failed segment, skip
-      if (downloaded[sendCursor] === null) break; // not yet attempted, wait
+      if (downloaded[sendCursor] === false) { sendCursor++; continue; }
+      if (downloaded[sendCursor] === null) break;
       try {
         await fetch("http://localhost:9876/brocoflix-chunk", {
           method: "POST",
@@ -846,7 +842,7 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
       } catch (err) {
         console.log(`[BF-sw] chunk ${sendCursor} POST failed: ${err.message}`);
       }
-      downloaded[sendCursor] = null; // free memory
+      downloaded[sendCursor] = null;
       sendCursor++;
     }
   }
@@ -857,45 +853,48 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
   for (let segIdx = 0; segIdx < totalSegs; segIdx++) {
     if (alreadyDone.has(segIdx)) continue;
 
-    // Check if session was aborted
     if (!brocoflixSessions.has(sessionId)) {
       console.log(`[BF-sw] Session ${sessionId} was cleaned up, stopping`);
       return;
     }
 
-    // Proactive reload — disabled for SW path (no GOAWAY in SW socket pool).
-    // Only enable if we observe GOAWAY-like failures from the SW.
-    if (false && BROCOFLIX_RELOAD_THRESHOLD > 0 && segsFetchedThisCycle >= BROCOFLIX_RELOAD_THRESHOLD) {
-      await flushToServer();
-      needsReload = true;
-      reloadReason = "proactive";
-      console.log(`[BF-sw] Proactive reload after ${segsFetchedThisCycle} segments. ${allCompleted.size}/${totalSegs} total done.`);
-      break;
-    }
-
     let ok = false;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30000);
-      const segResp = await fetch(segments[segIdx], {
-        signal: controller.signal,
-        mode: "cors",
-        credentials: "include",
-        cache: "no-store",
-        headers: replayHeaders,
-      });
-      clearTimeout(timer);
-      if (!segResp.ok) throw new Error(`HTTP ${segResp.status}`);
-      const arrayBuf = await segResp.arrayBuffer();
-      downloaded[segIdx] = arrayBuf;
-      ok = true;
-    } catch (err) {
-      console.log(`[BF-sw] Segment ${segIdx} FAILED: ${err.message}`);
+    let lastErr = "";
+    for (let attempt = 0; attempt <= MAX_429_RETRIES; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 30000);
+        const segResp = await fetch(segments[segIdx], {
+          signal: controller.signal,
+          mode: "cors",
+          credentials: "include",
+          cache: "no-store",
+          headers: replayHeaders,
+        });
+        clearTimeout(timer);
+        if (segResp.status === 429) {
+          const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+          if (attempt < MAX_429_RETRIES) {
+            console.log(`[BF-sw] Segment ${segIdx} got 429, backing off ${backoff / 1000}s (attempt ${attempt + 1}/${MAX_429_RETRIES})`);
+            await new Promise(r => setTimeout(r, backoff));
+            continue;
+          }
+          throw new Error("HTTP 429 after max retries");
+        }
+        if (!segResp.ok) throw new Error(`HTTP ${segResp.status}`);
+        const arrayBuf = await segResp.arrayBuffer();
+        downloaded[segIdx] = arrayBuf;
+        ok = true;
+        break;
+      } catch (err) {
+        lastErr = err.message;
+        if (attempt < MAX_429_RETRIES && lastErr.includes("429")) continue;
+        break;
+      }
     }
 
     if (ok) {
       segsFetchedThisCycle++;
-      consecutiveFails = 0;
       allCompleted.add(segIdx);
       await flushToServer();
 
@@ -903,26 +902,16 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
         console.log(`[BF-sw] Progress: ${allCompleted.size}/${totalSegs} done (cycle: ${segsFetchedThisCycle}, skipped: ${failedThisCycle.length})`);
       }
     } else {
-      downloaded[segIdx] = false; // mark as failed so flushToServer skips past it
+      console.log(`[BF-sw] Segment ${segIdx} FAILED: ${lastErr}`);
+      downloaded[segIdx] = false;
       failedThisCycle.push(segIdx);
-      consecutiveFails++;
-
-      if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
-        await flushToServer();
-        needsReload = true;
-        reloadReason = "consecutive_fails";
-        console.log(`[BF-sw] ${MAX_CONSECUTIVE_FAILS} consecutive failures. ${allCompleted.size}/${totalSegs} done. Requesting reload...`);
-        break;
-      }
     }
-
-    await new Promise(r => setTimeout(r, THROTTLE_MS));
   }
 
   await flushToServer();
 
-  // Handle failures / reload request
-  if (!needsReload && failedThisCycle.length > 0) {
+  // Handle failures via page reload
+  if (failedThisCycle.length > 0) {
     needsReload = true;
     reloadReason = "retry_failures";
     console.log(`[BF-sw] Pass complete. ${allCompleted.size}/${totalSegs} done, ${failedThisCycle.length} failed: [${failedThisCycle.join(",")}]. Requesting reload...`);
